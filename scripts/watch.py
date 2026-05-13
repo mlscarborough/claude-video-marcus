@@ -7,6 +7,7 @@ then Reads each frame path to see the video.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -14,6 +15,12 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
+
+# Load .env from ~/.config/watch/.env before any local imports that read env
+from dotenv import load_dotenv  # noqa: E402
+_env_path = Path.home() / ".config" / "watch" / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
 
 from download import download, is_url  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract, format_time, get_metadata, parse_time  # noqa: E402
@@ -26,9 +33,9 @@ def main() -> int:
         prog="watch",
         description="Download a video, extract auto-scaled frames, and surface the transcript.",
     )
-    ap.add_argument("source", help="Video URL or local file path")
-    ap.add_argument("--max-frames", type=int, default=80, help="Cap on frame count (default 80, hard max 100)")
-    ap.add_argument("--resolution", type=int, default=512, help="Frame width in pixels (default 512)")
+    ap.add_argument("source", nargs="?", default=None, help="Video URL or local file path")
+    ap.add_argument("--max-frames", type=int, default=None, help="Cap on frame count")
+    ap.add_argument("--resolution", type=int, default=None, help="Frame width in pixels")
     ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
     ap.add_argument("--start", type=str, default=None, help="Range start (SS, MM:SS, or HH:MM:SS)")
     ap.add_argument("--end", type=str, default=None, help="Range end (SS, MM:SS, or HH:MM:SS)")
@@ -44,9 +51,67 @@ def main() -> int:
         default=None,
         help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
     )
+    ap.add_argument(
+        "--mode",
+        choices=["regular", "chart"],
+        default="regular",
+        help="Processing mode. chart uses higher resolution and more frames.",
+    )
+    ap.add_argument(
+        "--keep",
+        choices=["none", "transcript", "all"],
+        default="none",
+        help="Retention level for local raw files after 48h cleanup.",
+    )
+    ap.add_argument(
+        "--provider",
+        choices=["gemini", "claude", "auto"],
+        default="auto",
+        help="Force a specific vision model provider.",
+    )
+    ap.add_argument(
+        "--health",
+        action="store_true",
+        help="Show system health dashboard and exit.",
+    )
+    ap.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run sanity checks and explain any failures.",
+    )
     args = ap.parse_args()
 
-    max_frames = min(args.max_frames, 100)
+    # Handle observability commands (no source required)
+    if args.health or args.doctor:
+        try:
+            from health import run_health, run_doctor
+            if args.health:
+                return run_health()
+            else:
+                return run_doctor()
+        except ImportError as e:
+            print(f"[watch] health module not available: {e}", file=sys.stderr)
+            return 1
+
+    if args.source is None:
+        ap.error("source is required unless --health or --doctor is used")
+
+    # Apply mode-based defaults (only if user didn't explicitly pass the flag)
+    if args.mode == "chart":
+        if args.resolution is None:
+            args.resolution = 1920
+        if args.max_frames is None:
+            args.max_frames = 150
+    else:  # regular
+        if args.resolution is None:
+            args.resolution = 512
+        if args.max_frames is None:
+            args.max_frames = 80
+
+    # Persist mode/keep/provider into env so sub-scripts can read them
+    os.environ["WATCH_MODE"] = args.mode
+    os.environ["WATCH_KEEP"] = args.keep
+    os.environ["WATCH_PROVIDER"] = args.provider
 
     if args.out_dir:
         work = Path(args.out_dir).expanduser().resolve()
@@ -54,6 +119,7 @@ def main() -> int:
         work = Path(tempfile.mkdtemp(prefix="watch-"))
     work.mkdir(parents=True, exist_ok=True)
     print(f"[watch] working dir: {work}", file=sys.stderr)
+    print(f"[watch] mode={args.mode} keep={args.keep} provider={args.provider}", file=sys.stderr)
 
     print(
         "[watch] downloading via yt-dlp…" if is_url(args.source) else "[watch] using local file…",
@@ -81,9 +147,9 @@ def main() -> int:
     focused = start_sec is not None or end_sec is not None
 
     if focused:
-        fps, target = auto_fps_focus(effective_duration, max_frames=max_frames)
+        fps, target = auto_fps_focus(effective_duration, max_frames=args.max_frames)
     else:
-        fps, target = auto_fps(effective_duration, max_frames=max_frames)
+        fps, target = auto_fps(effective_duration, max_frames=args.max_frames)
     if args.fps is not None:
         fps = min(args.fps, MAX_FPS)
         target = max(1, int(round(fps * effective_duration)))
@@ -99,7 +165,7 @@ def main() -> int:
         work / "frames",
         fps=fps,
         resolution=args.resolution,
-        max_frames=max_frames,
+        max_frames=args.max_frames,
         start_seconds=start_sec,
         end_seconds=end_sec,
     )
@@ -139,7 +205,7 @@ def main() -> int:
             )
             setup_py = SCRIPT_DIR / "setup.py"
             print(
-                f"[watch] {hint} — run `python3 {setup_py}` to enable the Whisper fallback",
+                f"[watch] {hint} — run `python {setup_py}` to enable the Whisper fallback",
                 file=sys.stderr,
             )
 
@@ -161,9 +227,10 @@ def main() -> int:
         )
     if meta.get("width") and meta.get("height"):
         print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
-    mode = "focused" if focused else "full"
-    print(f"- **Frames:** {len(frames)} @ {fps:.3f} fps, {mode} mode (budget {target}, max {max_frames})")
+    mode_label = "focused" if focused else "full"
+    print(f"- **Frames:** {len(frames)} @ {fps:.3f} fps, {mode_label} mode (budget {target}, max {args.max_frames})")
     print(f"- **Frame size:** {args.resolution}px wide")
+    print(f"- **Watch mode:** {args.mode} | **Provider:** {args.provider} | **Keep:** {args.keep}")
     if transcript_segments:
         in_range = " in range" if focused else ""
         print(
@@ -216,12 +283,30 @@ def main() -> int:
             "_No transcript available — proceed with frames only. "
             "Captions were missing and the Whisper fallback was unavailable "
             "(no API key set, or `--no-whisper` was used). "
-            f"Run `python3 {setup_py}` to enable Whisper, then re-run._"
+            f"Run `python {setup_py}` to enable Whisper, then re-run._"
         )
 
     print()
     print("---")
-    print(f"_Work dir: `{work}` — delete when done._")
+    print(f"_Work dir: `{work}` — mode={args.mode}, keep={args.keep}._")
+
+    # Run cleanup on old work dirs (best-effort, non-blocking)
+    try:
+        from cleanup import cleanup_work_dirs
+        cleanup_work_dirs()
+    except Exception:
+        pass
+
+    # Run sync-wiki --quick on each /watch invocation (catches edits made since last run)
+    if os.environ.get("WATCH_IS_WRITER_LAPTOP", "false").lower() == "true":
+        try:
+            import subprocess
+            subprocess.run(
+                [sys.executable, str(SCRIPT_DIR / "sync_wiki.py"), "--quick"],
+                capture_output=True, timeout=10
+            )
+        except Exception:
+            pass
 
     return 0
 
