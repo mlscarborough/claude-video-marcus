@@ -1,0 +1,27 @@
+# Python dependencies for /watch skill (personal-v1)
+# Pinned versions verified compatible as of 2026-05-12
+
+# OCR
+pytesseract==0.3.13
+Pillow==12.2.0
+
+# Computer vision (for v1.1 chart/slide detection; pinned now to avoid future install delays)
+opencv-python==4.10.0.84
+
+# File system monitoring (sync watcher)
+watchdog==6.0.0
+
+# Vision and embedding APIs
+google-generativeai==0.8.3
+
+# Audio transcription fallback
+groq==0.13.1
+
+# Supabase client
+supabase==2.10.0
+
+# Utility
+python-dotenv==1.0.1
+requests==2.32.3
+PyYAML==6.0.2
+numpy==2.2.6
