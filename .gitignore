@@ -14,3 +14,11 @@ htmlcov/
 
 # local Claude Code settings
 .claude/settings.local.json
+
+# personal-v1 additions
+.env
+*.swp
+.DS_Store
+work-*/
+scripts/_test_*.py
+scripts/_check_*.py
