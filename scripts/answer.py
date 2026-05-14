@@ -253,6 +253,37 @@ def main() -> int:
             pass
 
         print(result["answer"])
+
+        # Persist to wiki + Supabase (best-effort, writer laptop gated inside persist_all)
+        try:
+            run_meta_file = work_dir / "watch_run.json"
+            if run_meta_file.exists():
+                run_meta = json.loads(run_meta_file.read_text(encoding="utf-8"))
+                from persist import persist_all, parse_ai_output
+                ai_out = parse_ai_output(result["answer"], args.question)
+                video_meta = {
+                    "source_url": run_meta.get("source_url", ""),
+                    "title": run_meta.get("title"),
+                    "creator": run_meta.get("creator"),
+                    "duration_seconds": run_meta.get("duration_seconds"),
+                    "mode": run_meta.get("mode", args.mode),
+                    "vision_provider": result.get("provider", "gemini"),
+                    "model_used": result.get("model"),
+                    "tokens_in": result.get("tokens_in"),
+                    "tokens_out": result.get("tokens_out"),
+                    "retention": run_meta.get("retention", "ephemeral"),
+                }
+                persist_all(
+                    source_url=run_meta.get("source_url", ""),
+                    video_meta=video_meta,
+                    ai_output=ai_out,
+                    frame_results=run_meta.get("frame_results", []),
+                    transcript_segments=run_meta.get("transcript_segments", []),
+                    work_dir=work_dir,
+                )
+        except Exception as _persist_err:
+            print(f"[answer] persist failed (non-fatal): {_persist_err}", file=sys.stderr)
+
         return 0
 
     except FallbackToClaude as e:

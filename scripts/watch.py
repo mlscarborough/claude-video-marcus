@@ -7,6 +7,7 @@ then Reads each frame path to see the video.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -222,6 +223,35 @@ def main() -> int:
             )
 
     info = dl.get("info") or {}
+
+    # Write watch_run.json so answer.py can call persist_all() after a successful vision call
+    try:
+        _frame_results = []
+        for _i, _frame in enumerate(frames):
+            _ocr = ocr_results[_i] if _i < len(ocr_results) else {}
+            _frame_results.append({
+                "path": _frame["path"],
+                "timestamp_seconds": _frame["timestamp_seconds"],
+                "text": _ocr.get("text", ""),
+                "included_in_prompt": bool(_ocr.get("included_in_prompt", False)),
+                "confidence_avg": _ocr.get("confidence_avg"),
+                "relevance_score": _ocr.get("relevance_score"),
+            })
+        (work / "watch_run.json").write_text(
+            json.dumps({
+                "source_url": args.source,
+                "title": info.get("title"),
+                "creator": info.get("uploader"),
+                "duration_seconds": full_duration,
+                "mode": args.mode,
+                "retention": args.keep,
+                "frame_results": _frame_results,
+                "transcript_segments": transcript_segments,
+            }, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as _e:
+        print(f"[watch] watch_run.json write failed (non-fatal): {_e}", file=sys.stderr)
 
     print()
     print("# watch: video report")
