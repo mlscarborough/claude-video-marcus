@@ -67,7 +67,70 @@ TRANSCRIPT (timestamps in MM:SS format):
 
 IMAGES: I have provided {n_frames} frames at {resolution}px.
 
-USER QUESTION: {question}"""
+USER QUESTION: {question}
+
+ENTITY EXTRACTION — include in your JSON response:
+When identifying topics covered in this video, use slugs from the TOPIC TAXONOMY below.
+Pick the MOST SPECIFIC applicable slug(s). List each slug as a separate entity.
+
+RULES FOR TOPIC SLUGS:
+- Use the exact slug path shown (e.g. "real-estate/multi-family/management/evictions")
+- Do NOT invent new slugs — use the closest match. Ancestor tagging is handled automatically,
+  so just provide the most specific slug (you don't need to list parent levels separately).
+- If a concept is not in the taxonomy, use the nearest parent slug AND add a note in a
+  separate entity with type "keyword" describing the missing concept. Do NOT use "(new: ...)"
+  notation — the system handles proposals automatically.
+
+TOPIC TAXONOMY (excerpt — most relevant domains shown):
+{taxonomy_excerpt}
+
+Return JSON:
+{{
+  "answer": "...",
+  "sentiment_overall": "bullish|bearish|neutral|mixed|null",
+  "confidence": 0.0-1.0,
+  "entities": [
+    {{"type": "topic",   "value": "real-estate/multi-family/acquisition/hard-money"}},
+    {{"type": "ticker",  "value": "NVDA"}},
+    {{"type": "person",  "value": "Brandon Turner"}},
+    {{"type": "keyword", "value": "wraparound mortgage"}}
+  ]
+}}"""
+
+CHART_MODE_PROMPT_SUFFIX = """
+
+TOPIC TAXONOMY (for entity extraction — use most specific slug):
+{taxonomy_excerpt}
+
+Return JSON with the same schema shown in the regular prompt (answer, sentiment_overall,
+confidence, entities). Tags [TEXT_READ]/[VERBAL]/[ESTIMATED] are mandatory on every number."""
+
+
+def _detect_domains(question: str, transcript: str) -> list[str]:
+    """Heuristic: detect which taxonomy domains are likely relevant to inject a focused excerpt."""
+    combined = (question + " " + transcript[:500]).lower()
+    domains: list[str] = []
+    if any(w in combined for w in [
+        "real estate", "property", "rental", "multi-family", "multifamily",
+        "apartment", "flip", "landlord", "tenant", "lease", "rehab", "cap rate",
+        "noi", "dscr", "1031", "hard money", "seller finance",
+    ]):
+        domains.append("real-estate")
+    if any(w in combined for w in [
+        "trading", "options", "stock", "ticker", "chart", "put", "call",
+        "scalp", "swing", "rsi", "macd", "candlestick", "earnings", "short",
+        "long", "theta", "delta", "iron condor", "spreads",
+    ]):
+        domains.append("trading")
+    if any(w in combined for w in [
+        "ai", "llm", "model", "gpt", "claude", "gemini", "llama", "agent",
+        "rag", "embedding", "fine-tun", "prompt", "inference", "vector",
+        "langchain", "openai", "anthropic",
+    ]):
+        domains.append("artificial-intelligence")
+    # Always include general as a catch-all
+    domains.append("general")
+    return domains or None  # None = include everything
 
 
 def _build_prompt(transcript: str, ocr_included: list[dict], question: str,
@@ -78,15 +141,33 @@ def _build_prompt(transcript: str, ocr_included: list[dict], question: str,
         if r.get("text", "").strip()
     ) or "(no high-relevance OCR text)"
 
-    template = CHART_MODE_PROMPT if mode == "chart" else REGULAR_MODE_PROMPT
-    return template.format(
-        duration=int(duration),
-        transcript=transcript or "(no transcript available)",
-        ocr_text=ocr_text,
-        question=question,
-        n_frames=n_frames,
-        resolution=resolution,
-    )
+    # Build focused taxonomy excerpt (domain-filtered, capped at 60 lines)
+    try:
+        from taxonomy import get_taxonomy_excerpt
+        domains = _detect_domains(question, transcript)
+        taxonomy_excerpt = get_taxonomy_excerpt(domains, max_lines=60)
+    except Exception:
+        taxonomy_excerpt = "(taxonomy unavailable — use general topic descriptions)"
+
+    if mode == "chart":
+        base = CHART_MODE_PROMPT.format(
+            duration=int(duration),
+            transcript=transcript or "(no transcript available)",
+            ocr_text=ocr_text,
+            question=question,
+            n_frames=n_frames,
+            resolution=resolution,
+        )
+        return base + CHART_MODE_PROMPT_SUFFIX.format(taxonomy_excerpt=taxonomy_excerpt)
+    else:
+        return REGULAR_MODE_PROMPT.format(
+            duration=int(duration),
+            transcript=transcript or "(no transcript available)",
+            question=question,
+            n_frames=n_frames,
+            resolution=resolution,
+            taxonomy_excerpt=taxonomy_excerpt,
+        )
 
 
 def call_gemini_vision(model_name: str, frame_paths: list[Path], transcript: str,
@@ -258,6 +339,14 @@ def main() -> int:
             print(f"[answer] --claude-answer file not found: {answer_file}", file=sys.stderr)
             return 1
         answer_text = answer_file.read_text(encoding="utf-8")
+
+        # Audit log for Claude answers (satisfies Rule 3 for this path too)
+        try:
+            from audit_client import log_audit
+            log_audit(model=args.model, input_data=args.question, output_data=answer_text)
+        except Exception:
+            pass
+
         _do_persist(work_dir, answer_text, args.question, args.mode,
                     provider="claude", model=args.model)
         return 0

@@ -30,7 +30,23 @@ IS_WRITER = os.environ.get("WATCH_IS_WRITER_LAPTOP", "false").lower() == "true"
 # ── Domain model ──────────────────────────────────────────────────────────────
 
 VALID_ENTITY_TYPES = {
-    "ticker", "person", "company", "topic", "keyword", "indicator", "price_level"
+    # General — any domain
+    "person",       # individual mentioned by name
+    "company",      # business / organisation
+    "topic",        # broad subject area ("options trading", "cap rates", "fine-tuning")
+    "keyword",      # general term that doesn't fit a narrower type
+    "concept",      # abstract idea ("attention mechanism", "cash-on-cash return")
+    # Finance / trading
+    "ticker",       # stock / options / crypto symbol (AAPL, SPY, BTC)
+    "indicator",    # technical indicator (RSI, MACD, Bollinger Bands)
+    "price_level",  # specific price / strike / target ($620, support at $580)
+    # Real estate
+    "property",     # specific property, address, or deal
+    "location",     # geographic area — neighbourhood, city, metro market, zip code
+    "market",       # RE market condition or sub-market ("Phoenix multifamily", "STR")
+    # AI / technology
+    "model",        # AI model name (GPT-4, Claude, Gemini, Llama-3)
+    "technology",   # framework, tool, library, platform (PyTorch, LangChain, Supabase)
 }
 
 
@@ -60,6 +76,13 @@ def parse_ai_output(raw: str, question: str) -> AIOutput:
 
     Gemini is asked to return JSON with {answer, sentiment_overall, confidence, entities}.
     If it returns plain prose, wraps it as-is with no entities.
+
+    Topic entity handling (22.2b + 22.4):
+    - Valid taxonomy slugs are expanded to all ancestor levels (multi-level tagging)
+    - Unknown slugs are passed through expand_or_propose() which either:
+        (a) maps to a similar existing node (similarity match)
+        (b) auto-accepts as a new approved node (depth >= 2)
+        (c) queues as proposed and falls back to nearest ancestor (depth 0/1)
     """
     text = raw.strip()
 
@@ -76,19 +99,61 @@ def parse_ai_output(raw: str, question: str) -> AIOutput:
         # Plain-prose fallback
         return AIOutput(question=question, answer=raw)
 
-    entities = []
+    # Lazy imports — taxonomy is only needed on writer laptop when DB is available
+    try:
+        from taxonomy import is_valid_slug, taxonomy_expand, expand_or_propose
+        _taxonomy_available = True
+    except Exception:
+        _taxonomy_available = False
+
+    raw_entities = []
     for e in data.get("entities", []):
         etype = e.get("type", e.get("entity_type", "keyword")).lower()
         if etype not in VALID_ENTITY_TYPES:
             etype = "keyword"
-        entities.append(Entity(
+        raw_entities.append(Entity(
             entity_type=etype,
-            entity_value=str(e.get("value", e.get("entity_value", ""))),
+            entity_value=str(e.get("value", e.get("entity_value", ""))).strip(),
             mention_count=int(e.get("mention_count", 1)),
             first_mentioned_at_seconds=e.get("first_mentioned_at_seconds"),
             sentiment=e.get("sentiment"),
             relevance=float(e.get("relevance", 0.5)) if e.get("relevance") is not None else None,
         ))
+
+    # Expand topic slugs to all ancestor levels (multi-level tagging)
+    entities: list[Entity] = []
+    seen_topic_slugs: set[str] = set()
+
+    for e in raw_entities:
+        if e.entity_type != "topic" or not _taxonomy_available:
+            entities.append(e)
+            continue
+
+        slug = e.entity_value
+
+        # Skip blank or obviously non-slug values
+        if not slug or len(slug) < 2:
+            continue
+
+        # Resolve unknown slugs through the expansion engine
+        if not is_valid_slug(slug):
+            slug = expand_or_propose(slug, context=question[:120])
+
+        # Expand to all ancestor levels — each becomes its own entity row
+        expanded_slugs = taxonomy_expand(slug)
+        for s in expanded_slugs:
+            if s in seen_topic_slugs:
+                continue
+            seen_topic_slugs.add(s)
+            entities.append(Entity(
+                entity_type="topic",
+                entity_value=s,
+                mention_count=e.mention_count,
+                first_mentioned_at_seconds=e.first_mentioned_at_seconds,
+                sentiment=e.sentiment,
+                # Only preserve relevance on the most-specific (original) slug
+                relevance=e.relevance if s == slug else None,
+            ))
 
     return AIOutput(
         question=question,
@@ -353,11 +418,24 @@ def _format_entities(entities: list[Entity]) -> str:
     return "\n".join(lines)
 
 
-def _format_xrefs(entities: list[Entity]) -> str:
-    tickers = [e.entity_value for e in entities if e.entity_type == "ticker"]
-    if not tickers:
-        return "_No ticker cross-references._"
-    return "\n".join(f"- [[{t}]]" for t in tickers)
+def _format_crossrefs(entities: list[Entity]) -> str:
+    """Generate Obsidian wikilinks for entities that warrant their own hub pages.
+
+    Linkable types span all domains — any entity type that the nodal wiki
+    will build a hub page for gets a wikilink here.
+    """
+    LINKABLE = {
+        "ticker",       # finance
+        "company",      # general
+        "property",     # real estate
+        "location",     # real estate
+        "model",        # AI
+        "technology",   # AI / tech
+    }
+    linked = [e for e in entities if e.entity_type in LINKABLE]
+    if not linked:
+        return "_No cross-references._"
+    return "\n".join(f"- [[{e.entity_value}]]" for e in linked)
 
 
 def write_wiki_page(
@@ -391,8 +469,10 @@ def write_wiki_page(
             filename   = f"{date_str}-{creator_slug}-{title_slug}-{duration_code}-{url_suffix}.md"
             page_path  = vault_path / "videos" / filename
 
-    tickers = [e.entity_value for e in ai_output.entities if e.entity_type == "ticker"]
-    indicators = [e.entity_value for e in ai_output.entities if e.entity_type == "indicator"]
+    # Group entities by type for structured frontmatter.
+    # Keys are present for all known groups; empty lists are fine in YAML (grep-friendly).
+    def _ents(etype: str) -> list[str]:
+        return [e.entity_value for e in ai_output.entities if e.entity_type == etype]
 
     frontmatter_data = {
         "type": "video_analysis",
@@ -405,8 +485,18 @@ def write_wiki_page(
         "vision_provider": video_meta.get("vision_provider", ""),
         "sentiment_overall": ai_output.sentiment_overall,
         "confidence": ai_output.confidence,
-        "tickers": tickers,
-        "indicators": indicators,
+        # Finance
+        "tickers": _ents("ticker"),
+        "indicators": _ents("indicator"),
+        # Real estate
+        "locations": _ents("location"),
+        "properties": _ents("property"),
+        "markets": _ents("market"),
+        # AI / technology
+        "models": _ents("model"),
+        "technologies": _ents("technology"),
+        # General
+        "topics": _ents("topic"),
         "tags": ["video", "auto-generated"],
     }
     if video_id:
@@ -437,7 +527,7 @@ def write_wiki_page(
 
 ## Cross-references
 
-{_format_xrefs(ai_output.entities)}
+{_format_crossrefs(ai_output.entities)}
 """
 
     content = f"---\n{fm_text}---\n\n{body}"
