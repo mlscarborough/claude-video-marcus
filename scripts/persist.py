@@ -16,6 +16,7 @@ import re
 import socket
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -100,12 +101,243 @@ def parse_ai_output(raw: str, question: str) -> AIOutput:
 
 # ── Wiki markdown writer ──────────────────────────────────────────────────────
 
-def _slugify(text: str) -> str:
-    text = (text or "video").lower()
+def _slugify(text: str, max_chars: int = 60) -> str:
+    """Convert arbitrary text to a URL-safe slug, capped at max_chars."""
+    text = (text or "unknown").lower()
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_-]+", "-", text)
-    return text[:60].strip("-")
+    return text[:max_chars].strip("-")
 
+
+# ── Duplicate-detection enums ─────────────────────────────────────────────────
+
+class DuplicateResult(Enum):
+    NEW      = "new"      # No meaningful match found
+    LIKELY   = "likely"   # Partial match — needs human confirmation
+    DEFINITE = "definite" # Clearly the same video
+
+
+class DuplicateResolution(Enum):
+    SKIP   = "skip"   # Keep existing entry; discard incoming
+    UPDATE = "update" # Overwrite existing wiki + DB row with new analysis
+    NEW    = "new"    # Create a separate entry regardless
+
+
+# ── Fingerprint computation ───────────────────────────────────────────────────
+
+def compute_transcript_fingerprint(transcript_segments: list[dict]) -> Optional[str]:
+    """SHA-256 of the first 500 characters of combined transcript text.
+
+    Returns None if no transcript is available.
+    500 chars is long enough to be unique, short enough to be stable
+    even if the end of the transcript differs (ads, outros, etc.).
+    """
+    if not transcript_segments:
+        return None
+    combined = " ".join(
+        seg.get("text", "") for seg in transcript_segments
+    ).lower().strip()
+    if not combined:
+        return None
+    sample = combined[:500]
+    return hashlib.sha256(sample.encode("utf-8")).hexdigest()
+
+
+def compute_content_fingerprint(creator: str, duration_seconds: float, title: str) -> str:
+    """SHA-256 of '{creator_norm}|{duration_rounded}|{title_norm}'.
+
+    Cheap to compute (no transcript needed). Used for the fast DB pre-query.
+
+    Normalisation rules:
+    - creator:   lowercase, strip whitespace
+    - duration:  rounded to nearest integer (handles float precision noise)
+    - title:     lowercase, strip punctuation and whitespace
+    """
+    creator_norm  = (creator or "").lower().strip()
+    duration_norm = str(int(round(duration_seconds or 0)))
+    title_norm    = re.sub(r"[^\w\s]", "", (title or "").lower()).strip()
+    raw           = f"{creator_norm}|{duration_norm}|{title_norm}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# ── Duplicate detection query ─────────────────────────────────────────────────
+
+def find_potential_duplicate(
+    sb,
+    source_url: str,
+    creator: str,
+    duration_seconds: float,
+    title: str,
+    content_fingerprint: str,
+    transcript_fingerprint: Optional[str],
+) -> tuple[DuplicateResult, Optional[dict], str]:
+    """Query videos table for potential duplicates.
+
+    Returns (DuplicateResult, existing_row_or_None, match_explanation).
+
+    Scoring system:
+      Exact URL match        → 100 (bypass scoring, return DEFINITE immediately)
+      content_fingerprint    →  70
+      transcript_fingerprint →  50
+      Same creator (norm)    →  30
+      Duration within ±3s    →  40
+      Title similarity ≥80%  →  20
+
+    Thresholds:
+      ≥90  → DEFINITE   (update or skip without prompting)
+      50–89 → LIKELY    (show resolution prompt)
+      <50   → NEW       (proceed normally)
+    """
+    # Step 0: Exact URL match — definite, no scoring needed
+    exact = (
+        sb.table("videos")
+        .select("id,source_url,title,creator,duration_seconds,wiki_path,processed_at")
+        .eq("source_url", source_url)
+        .limit(1)
+        .execute()
+    )
+    if exact.data:
+        return DuplicateResult.DEFINITE, exact.data[0], "exact URL match"
+
+    # Step 1: Fingerprint-based candidate fetch (two separate queries — avoids OR on nullable cols)
+    candidates: list[dict] = []
+
+    cf_result = (
+        sb.table("videos")
+        .select("id,source_url,title,creator,duration_seconds,wiki_path,processed_at,"
+                "content_fingerprint,transcript_fingerprint")
+        .eq("content_fingerprint", content_fingerprint)
+        .execute()
+    )
+    candidates.extend(cf_result.data)
+
+    if transcript_fingerprint:
+        tf_result = (
+            sb.table("videos")
+            .select("id,source_url,title,creator,duration_seconds,wiki_path,processed_at,"
+                    "content_fingerprint,transcript_fingerprint")
+            .eq("transcript_fingerprint", transcript_fingerprint)
+            .execute()
+        )
+        existing_ids = {r["id"] for r in candidates}
+        candidates.extend(r for r in tf_result.data if r["id"] not in existing_ids)
+
+    if not candidates:
+        return DuplicateResult.NEW, None, ""
+
+    # Step 2: Score each candidate; surface the highest-scoring match
+    title_norm_in = re.sub(r"[^\w\s]", "", (title or "").lower()).strip()
+    creator_norm_in = (creator or "").lower().strip()
+
+    best_score = 0
+    best_match: Optional[dict] = None
+    best_signals: list[str] = []
+
+    for row in candidates:
+        score = 0
+        signals: list[str] = []
+
+        if row.get("content_fingerprint") == content_fingerprint:
+            score += 70
+            signals.append("content fingerprint (+70)")
+
+        if transcript_fingerprint and row.get("transcript_fingerprint") == transcript_fingerprint:
+            score += 50
+            signals.append("transcript fingerprint (+50)")
+
+        row_creator = (row.get("creator") or "").lower().strip()
+        if row_creator and row_creator == creator_norm_in:
+            score += 30
+            signals.append("same creator (+30)")
+
+        row_dur = row.get("duration_seconds") or 0
+        dur_diff = abs(row_dur - (duration_seconds or 0))
+        if dur_diff <= 3:
+            score += 40
+            signals.append(f"duration ±{dur_diff:.0f}s (+40)")
+
+        row_title_norm = re.sub(r"[^\w\s]", "", (row.get("title") or "").lower()).strip()
+        similarity = difflib.SequenceMatcher(None, title_norm_in, row_title_norm).ratio()
+        if similarity >= 0.80:
+            score += 20
+            signals.append(f"title {int(similarity * 100)}% match (+20)")
+
+        if score > best_score:
+            best_score = score
+            best_match = row
+            best_signals = signals
+
+    explanation = ", ".join(best_signals) + f" = {best_score}"
+
+    if best_score >= 90:
+        return DuplicateResult.DEFINITE, best_match, explanation
+    elif best_score >= 50:
+        return DuplicateResult.LIKELY, best_match, explanation
+    else:
+        return DuplicateResult.NEW, None, ""
+
+
+# ── Duplicate resolution ──────────────────────────────────────────────────────
+
+def _format_duration(seconds: float) -> str:
+    """Convert 1231.0 → '20:31'."""
+    total = int(seconds or 0)
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def prompt_duplicate_resolution(
+    incoming: dict,
+    existing: dict,
+    result: DuplicateResult,
+    match_explanation: str,
+) -> DuplicateResolution:
+    """Interactive resolution prompt. Only called in non-batch mode."""
+    import sys
+
+    duration_str    = _format_duration(existing.get("duration_seconds", 0))
+    processed_str   = (existing.get("processed_at") or "unknown")[:10]
+
+    print(f"\n[watch] ⚠️  This video may already be in your knowledge base.\n", file=sys.stderr)
+    print(f"  Existing: \"{existing.get('title')}\" — {existing.get('creator')}", file=sys.stderr)
+    print(f"            Processed: {processed_str}, Duration: {duration_str}", file=sys.stderr)
+    print(f"            Wiki: {existing.get('wiki_path', 'unknown')}", file=sys.stderr)
+    print(f"            Match: {match_explanation}", file=sys.stderr)
+    print(f"\n  Incoming: \"{incoming.get('title')}\" — {incoming.get('creator')}", file=sys.stderr)
+    print(f"            Duration: {_format_duration(incoming.get('duration_seconds', 0))}\n",
+          file=sys.stderr)
+    print("  1. Skip   — keep existing entry", file=sys.stderr)
+    print("  2. Update — replace wiki + DB row with new analysis", file=sys.stderr)
+    print("  3. New    — create a separate entry\n", file=sys.stderr)
+
+    while True:
+        try:
+            choice = input("[watch] → ").strip()
+        except EOFError:
+            # Non-interactive context (piped stdin) — default to skip
+            print("[watch] Non-interactive; defaulting to Skip.", file=sys.stderr)
+            return DuplicateResolution.SKIP
+        if choice == "1":
+            return DuplicateResolution.SKIP
+        if choice == "2":
+            return DuplicateResolution.UPDATE
+        if choice == "3":
+            return DuplicateResolution.NEW
+        print("[watch] Please enter 1, 2, or 3.", file=sys.stderr)
+
+
+def auto_resolve(result: DuplicateResult) -> DuplicateResolution:
+    """Non-interactive resolution for batch mode or --yes flag.
+
+    Rules:
+    - DEFINITE → SKIP silently (clearly the same video; re-processing wastes quota)
+    - LIKELY   → SKIP with a warning (user can re-run interactively to confirm)
+    We never auto-UPDATE (would discard prior user edits to the wiki page).
+    We never auto-NEW in batch (would create duplicates on every re-run).
+    """
+    return DuplicateResolution.SKIP  # Both DEFINITE and LIKELY auto-skip
+
+
+# ── Wiki markdown writer ──────────────────────────────────────────────────────
 
 def _format_entities(entities: list[Entity]) -> str:
     if not entities:
@@ -136,9 +368,28 @@ def write_wiki_page(
 ) -> Path:
     """Write Obsidian markdown page. Returns absolute path."""
     date_str = datetime.now().strftime("%Y-%m-%d")
-    slug = _slugify(video_meta.get("title") or video_meta.get("source_url", "video"))
-    page_path = vault_path / "videos" / f"{date_str}-{slug}.md"
+
+    # Richer slug: {date}-{creator-slug}-{title-slug}-{duration-code}.md
+    # Each component limits collisions along a different axis.
+    creator_slug  = _slugify(video_meta.get("creator") or "unknown", max_chars=20)
+    title_slug    = _slugify(video_meta.get("title") or video_meta.get("source_url", "video"),
+                             max_chars=40)
+    duration_secs = int(video_meta.get("duration_seconds") or 0)
+    duration_code = str(duration_secs).zfill(4)   # e.g. "1231"; zfill is min width, not max
+
+    filename  = f"{date_str}-{creator_slug}-{title_slug}-{duration_code}.md"
+    page_path = vault_path / "videos" / filename
     page_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Collision fallback: if the target file already exists AND belongs to a different URL,
+    # append the last 6 hex chars of this URL's SHA-256 as a disambiguator.
+    source_url_for_slug = video_meta.get("source_url", "")
+    if page_path.exists() and source_url_for_slug:
+        existing_text = page_path.read_text(encoding="utf-8")
+        if f"source_url: {source_url_for_slug}" not in existing_text:
+            url_suffix = hashlib.sha256(source_url_for_slug.encode()).hexdigest()[-6:]
+            filename   = f"{date_str}-{creator_slug}-{title_slug}-{duration_code}-{url_suffix}.md"
+            page_path  = vault_path / "videos" / filename
 
     tickers = [e.entity_value for e in ai_output.entities if e.entity_type == "ticker"]
     indicators = [e.entity_value for e in ai_output.entities if e.entity_type == "indicator"]
@@ -269,14 +520,35 @@ def write_supabase_rows(
         "last_wiki_synced_at": datetime.now(timezone.utc).isoformat(),
         "wiki_edited_by_user": False,
         "created_on_machine": socket.gethostname(),
+        "transcript_fingerprint": video_meta.get("transcript_fingerprint"),
+        "content_fingerprint":    video_meta.get("content_fingerprint"),
     }
     if video_id is not None:
         row_data["id"] = video_id
-    video_row = sb.table("videos").insert(row_data).execute()
-    video_id = video_row.data[0]["id"]
+
+    # Upsert: update existing row if source_url already present; insert otherwise.
+    # Prevents duplicate `videos` rows on re-runs of the same URL.
+    existing = (
+        sb.table("videos")
+        .select("id")
+        .eq("source_url", source_url)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        existing_id = existing.data[0]["id"]
+        update_data = {k: v for k, v in row_data.items() if k != "id"}
+        sb.table("videos").update(update_data).eq("id", existing_id).execute()
+        video_id = existing_id
+        is_new_video = False
+    else:
+        video_row = sb.table("videos").insert(row_data).execute()
+        video_id = video_row.data[0]["id"]
+        is_new_video = True
 
     # Frames (batch insert, cap at 500 rows to stay under PostgREST limits)
-    if frame_results:
+    # Skip on re-runs — frames don't change between runs of the same video.
+    if frame_results and is_new_video:
         frame_rows = [
             {
                 "video_id": video_id,
@@ -295,8 +567,8 @@ def write_supabase_rows(
                 frame_rows[batch_start:batch_start + 500]
             ).execute()
 
-    # Transcript segments
-    if transcript_segments:
+    # Transcript segments — skip on re-runs
+    if transcript_segments and is_new_video:
         seg_source_map = {
             "captions": "captions",
             "whisper-groq": "whisper-groq",
@@ -319,8 +591,8 @@ def write_supabase_rows(
                 seg_rows[batch_start:batch_start + 500]
             ).execute()
 
-    # Entities
-    if ai_output.entities:
+    # Entities — skip on re-runs
+    if ai_output.entities and is_new_video:
         entity_rows = [
             {
                 "video_id": video_id,
@@ -485,11 +757,18 @@ def persist_all(
     frame_results: list[dict],
     transcript_segments: list[dict],
     work_dir: Path,
+    is_batch: bool = False,
+    yes_flag: bool = False,
 ) -> dict:
     """Write wiki page and (on writer laptop) Supabase rows + embeddings.
 
     Returns {"video_id": str | None, "wiki_path": Path}.
+    On duplicate skip: returns {"video_id": str, "wiki_path": None, "skipped": True}.
+
+    is_batch: when True, uses non-interactive auto_resolve() instead of prompting
+    yes_flag: when True, same effect as is_batch for resolution purposes
     """
+    import sys
     from dotenv import load_dotenv
     _env = Path.home() / ".config" / "watch" / ".env"
     if _env.exists():
@@ -502,10 +781,72 @@ def persist_all(
 
     is_writer = os.environ.get("WATCH_IS_WRITER_LAPTOP", "false").lower() == "true"
 
+    # ── Duplicate detection (writer laptop only — needs Supabase access) ──────
+    if is_writer:
+        try:
+            sb = _get_supabase()
+
+            tf = compute_transcript_fingerprint(transcript_segments)
+            cf = compute_content_fingerprint(
+                video_meta.get("creator", ""),
+                video_meta.get("duration_seconds", 0),
+                video_meta.get("title", ""),
+            )
+
+            dup_result, existing_row, explanation = find_potential_duplicate(
+                sb,
+                source_url=source_url,
+                creator=video_meta.get("creator", ""),
+                duration_seconds=video_meta.get("duration_seconds", 0),
+                title=video_meta.get("title", ""),
+                content_fingerprint=cf,
+                transcript_fingerprint=tf,
+            )
+
+            if dup_result != DuplicateResult.NEW:
+                if is_batch or yes_flag:
+                    resolution = auto_resolve(dup_result)
+                    if dup_result == DuplicateResult.LIKELY:
+                        print(f"[watch] ⚠️  Likely duplicate (skipped in batch): {source_url}",
+                              file=sys.stderr)
+                        print(f"         Match: {explanation}", file=sys.stderr)
+                    else:
+                        print(f"[watch] Definite duplicate — skipping: {source_url}", file=sys.stderr)
+                else:
+                    resolution = prompt_duplicate_resolution(
+                        video_meta, existing_row, dup_result, explanation
+                    )
+
+                if resolution == DuplicateResolution.SKIP:
+                    return {
+                        "video_id": existing_row["id"],
+                        "wiki_path": None,
+                        "skipped": True,
+                        "existing_wiki": existing_row.get("wiki_path"),
+                    }
+
+                if resolution == DuplicateResolution.UPDATE:
+                    # Reuse the existing video_id so write_supabase_rows() updates the right row
+                    video_meta["_existing_video_id"] = existing_row["id"]
+
+                # DuplicateResolution.NEW falls through to the normal write path
+
+            # Attach fingerprints to video_meta so write_supabase_rows() can store them
+            video_meta["transcript_fingerprint"] = tf
+            video_meta["content_fingerprint"] = cf
+
+        except Exception as _dup_err:
+            # Duplicate detection is best-effort — never blocks the write path
+            print(f"[watch] duplicate check skipped (non-fatal): {_dup_err}", file=sys.stderr)
+
     # Pre-generate video_id so wiki page is written once (with ID in frontmatter).
     # Eliminates the double-write that caused a sync-watcher race condition.
+    # If UPDATE resolution was chosen, use the existing video_id instead.
     import uuid as _uuid
-    pre_video_id = str(_uuid.uuid4()) if is_writer else None
+    if is_writer and video_meta.get("_existing_video_id"):
+        pre_video_id = video_meta["_existing_video_id"]
+    else:
+        pre_video_id = str(_uuid.uuid4()) if is_writer else None
 
     # Step 1: Write wiki page (always — both laptops, single write)
     wiki_path = write_wiki_page(ai_output, video_meta, vault_path, video_id=pre_video_id)
@@ -524,7 +865,6 @@ def persist_all(
     )
 
     if not is_writer:
-        import sys
         print("[watch] Read-only laptop — wiki written locally; Supabase writes skipped.", file=sys.stderr)
         return {"video_id": None, "wiki_path": wiki_path}
 
@@ -541,7 +881,6 @@ def persist_all(
     )
 
     # Step 3: pgvector embeddings (best-effort — failure does not block wiki/DB writes)
-    import sys
     n_chunks = 0
     try:
         n_chunks = write_embeddings(video_id, wiki_path)
