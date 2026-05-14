@@ -218,8 +218,12 @@ def write_supabase_rows(
     transcript_segments: list[dict],
     wiki_path: Path,
     vault_path: Path,
+    video_id: Optional[str] = None,
 ) -> str:
-    """Insert all rows. Returns video_id (uuid str). Uses service_role key (Rule 4)."""
+    """Insert all rows. Returns video_id (uuid str). Uses service_role key (Rule 4).
+
+    Pass video_id to use a pre-generated UUID (avoids a second wiki-page rewrite).
+    """
     sb = _get_supabase()
 
     wiki_content = wiki_path.read_text(encoding="utf-8")
@@ -244,7 +248,7 @@ def write_supabase_rows(
     elif not url_lower.startswith("http"):
         source_type = "local"
 
-    video_row = sb.table("videos").insert({
+    row_data: dict = {
         "source_url": source_url,
         "source_type": source_type,
         "title": video_meta.get("title"),
@@ -265,8 +269,10 @@ def write_supabase_rows(
         "last_wiki_synced_at": datetime.now(timezone.utc).isoformat(),
         "wiki_edited_by_user": False,
         "created_on_machine": socket.gethostname(),
-    }).execute()
-
+    }
+    if video_id is not None:
+        row_data["id"] = video_id
+    video_row = sb.table("videos").insert(row_data).execute()
     video_id = video_row.data[0]["id"]
 
     # Frames (batch insert, cap at 500 rows to stay under PostgREST limits)
@@ -495,8 +501,13 @@ def persist_all(
 
     is_writer = os.environ.get("WATCH_IS_WRITER_LAPTOP", "false").lower() == "true"
 
-    # Step 1: Write wiki page (always — both laptops)
-    wiki_path = write_wiki_page(ai_output, video_meta, vault_path)
+    # Pre-generate video_id so wiki page is written once (with ID in frontmatter).
+    # Eliminates the double-write that caused a sync-watcher race condition.
+    import uuid as _uuid
+    pre_video_id = str(_uuid.uuid4()) if is_writer else None
+
+    # Step 1: Write wiki page (always — both laptops, single write)
+    wiki_path = write_wiki_page(ai_output, video_meta, vault_path, video_id=pre_video_id)
 
     # Save watch_meta.json in work_dir for refine.py and other scripts
     meta_file = work_dir / "watch_meta.json"
@@ -516,7 +527,7 @@ def persist_all(
         print("[watch] Read-only laptop — wiki written locally; Supabase writes skipped.", file=sys.stderr)
         return {"video_id": None, "wiki_path": wiki_path}
 
-    # Step 2: Supabase row writes (writer laptop only)
+    # Step 2: Supabase row writes (writer laptop only, uses pre-generated video_id)
     video_id = write_supabase_rows(
         source_url=source_url,
         video_meta=video_meta,
@@ -525,10 +536,8 @@ def persist_all(
         transcript_segments=transcript_segments,
         wiki_path=wiki_path,
         vault_path=vault_path,
+        video_id=pre_video_id,
     )
-
-    # Update wiki page with video_id now that we have it
-    write_wiki_page(ai_output, video_meta, vault_path, video_id=video_id)
 
     # Step 3: pgvector embeddings (best-effort — failure does not block wiki/DB writes)
     import sys

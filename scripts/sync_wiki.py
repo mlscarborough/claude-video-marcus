@@ -114,7 +114,7 @@ def sync_file(path: Path, vault_path: Path | None = None) -> bool:
         .maybe_single()
         .execute()
     )
-    if not row.data:
+    if row is None or not row.data:
         print(f"[sync-wiki] {rel_path}: not a watch-managed file, skipping", file=sys.stderr)
         return False
 
@@ -123,13 +123,13 @@ def sync_file(path: Path, vault_path: Path | None = None) -> bool:
     new_content: str = path.read_text(encoding="utf-8")
     new_hash = hashlib.sha256(new_content.encode()).hexdigest()
 
-    # Update videos table
+    # Update videos table (.select() forces 200 with body instead of 204 No Content)
     sb.table("videos").update({
         "wiki_content": new_content,
         "wiki_content_hash": new_hash,
         "last_wiki_synced_at": datetime.now(timezone.utc).isoformat(),
         "wiki_edited_by_user": True,
-    }).eq("id", video_id).execute()
+    }).eq("id", video_id).select("id").execute()
 
     # Smart re-embed (only if content changed >= 20%)
     from persist import write_embeddings
