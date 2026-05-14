@@ -413,6 +413,7 @@ def _embed_chunks(chunks: list[str]) -> list[list[float]]:
             model="models/gemini-embedding-001",
             content=chunk,
             task_type="retrieval_document",
+            output_dimensionality=768,
         )
         embeddings.append(resp["embedding"])
 
