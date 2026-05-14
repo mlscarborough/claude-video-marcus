@@ -195,6 +195,36 @@ def check_tesseract_installed():
         )
 
 
+@_check("ffmpeg installed")
+def check_ffmpeg_installed():
+    import shutil
+    if shutil.which("ffmpeg"):
+        try:
+            r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+            ver = r.stdout.splitlines()[0] if r.stdout else "unknown"
+            return True, ver[:60], ""
+        except Exception as e:
+            return False, str(e), "winget install Gyan.FFmpeg"
+    # Check common Windows locations
+    candidates = [
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+    ]
+    found = next((p for p in candidates if Path(p).exists()), None)
+    if found:
+        return (
+            False,
+            f"ffmpeg found at {found} but not on PATH",
+            f"Add {Path(found).parent} to your PATH environment variable",
+        )
+    return (
+        False,
+        "ffmpeg not found on PATH",
+        "winget install Gyan.FFmpeg  (then open a new PowerShell to pick up PATH change)",
+    )
+
+
 @_check("Python version >= 3.10")
 def check_python_version():
     v = sys.version_info
@@ -368,7 +398,8 @@ def check_watcher_running():
         if "Running" in r.stdout:
             return True, "Running", ""
         lines = [l for l in r.stdout.splitlines() if "watch-sync-watcher" in l]
-        state = lines[0].split(",")[3].strip('"') if lines else "Unknown"
+        # CSV columns: TaskName, Next Run Time, Status (index 2)
+        state = lines[0].split(",")[2].strip('"') if lines else "Unknown"
         return (
             False,
             f"Task state: {state}",
@@ -400,6 +431,7 @@ def check_obsidian_vault_exists():
 
 CHECKS = [
     check_tesseract_installed,
+    check_ffmpeg_installed,
     check_python_version,
     check_env_file_exists,
     check_gemini_api_key,

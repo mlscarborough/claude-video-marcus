@@ -170,6 +170,18 @@ def main() -> int:
         end_seconds=end_sec,
     )
 
+    # Run OCR pipeline — creates .txt sidecars next to each .jpg for answer.py
+    ocr_results: list[dict] = []
+    try:
+        from ocr import run_ocr_pipeline
+        frame_paths_for_ocr = [Path(f["path"]) for f in frames]
+        print(f"[watch] running OCR on {len(frame_paths_for_ocr)} frames…", file=sys.stderr)
+        ocr_results = run_ocr_pipeline(frame_paths_for_ocr, mode=args.mode)
+        n_ocr_included = sum(1 for r in ocr_results if r.get("included_in_prompt"))
+        print(f"[watch] OCR done: {n_ocr_included}/{len(ocr_results)} frames have relevant text", file=sys.stderr)
+    except Exception as exc:
+        print(f"[watch] OCR failed (non-fatal): {exc}", file=sys.stderr)
+
     transcript_segments: list[dict] = []
     transcript_text: str | None = None
     transcript_source: str | None = None
@@ -230,6 +242,9 @@ def main() -> int:
     mode_label = "focused" if focused else "full"
     print(f"- **Frames:** {len(frames)} @ {fps:.3f} fps, {mode_label} mode (budget {target}, max {args.max_frames})")
     print(f"- **Frame size:** {args.resolution}px wide")
+    if ocr_results:
+        n_ocr_included = sum(1 for r in ocr_results if r.get("included_in_prompt"))
+        print(f"- **OCR:** {n_ocr_included}/{len(ocr_results)} frames have relevant text (sidecars written)")
     print(f"- **Watch mode:** {args.mode} | **Provider:** {args.provider} | **Keep:** {args.keep}")
     if transcript_segments:
         in_range = " in range" if focused else ""
@@ -289,6 +304,28 @@ def main() -> int:
     print()
     print("---")
     print(f"_Work dir: `{work}` — mode={args.mode}, keep={args.keep}._")
+
+    # Log telemetry (writer laptop only, best-effort)
+    try:
+        from telemetry import log_invocation
+        _url = args.source.lower()
+        _src_type = (
+            "youtube" if ("youtube.com" in _url or "youtu.be" in _url) else
+            "vimeo" if "vimeo.com" in _url else
+            "tiktok" if "tiktok.com" in _url else
+            "twitter" if ("twitter.com" in _url or "x.com" in _url) else
+            "local" if not _url.startswith("http") else
+            "other"
+        )
+        log_invocation(
+            mode=args.mode,
+            source_type=_src_type,
+            duration_seconds=full_duration,
+            provider=args.provider,
+            n_frames=len(frames),
+        )
+    except Exception:
+        pass
 
     # Run cleanup on old work dirs (best-effort, non-blocking)
     try:
