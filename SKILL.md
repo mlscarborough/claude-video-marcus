@@ -130,14 +130,27 @@ When the user asks for more detail at a specific timestamp, invoke the refine sc
 
 Refined frames are returned as paths you can Read. They are session-scoped and not saved to DB.
 
-## Step 6 — Persistence (automatic on writer laptop)
+## Step 6 — Persistence (mandatory after every answer)
 
-After answering, if `WATCH_IS_WRITER_LAPTOP=true`, the script automatically:
-- Writes a wiki markdown file to the Obsidian vault
-- Inserts structured rows into Supabase (videos, frames, entities, analyses)
-- Creates pgvector embeddings for semantic search
+After you finish answering the user, **always** persist — regardless of which provider was used.
 
-This happens in the background. No action required from you.
+### If Gemini answered (answer.py exited 0)
+Persistence ran automatically inside answer.py. Nothing extra needed.
+
+### If Claude answered directly (answer.py exited 9, or --provider claude)
+You must trigger persistence manually. Do this every time, no exceptions:
+
+1. Write your complete answer text to `<work_dir>/claude_answer.md` using the Write tool.
+2. Run:
+```bash
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/answer.py" "<work_dir>" "<question>" --claude-answer "<work_dir>/claude_answer.md" --model claude-sonnet-4-6
+```
+
+This writes the Obsidian wiki page, inserts Supabase rows (videos, frames, transcript, entities, analyses), and generates pgvector embeddings.
+
+**The work_dir is printed in the watch.py stderr output as `[watch] working dir: <path>`.**
+
+Persistence is best-effort — if it fails, the error is printed to stderr and does not affect your answer. But do not skip the step.
 
 ## Gemini / Claude provider routing
 

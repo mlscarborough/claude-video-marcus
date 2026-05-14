@@ -197,6 +197,41 @@ def _find_work_artifacts(work_dir: Path) -> dict:
     }
 
 
+def _do_persist(work_dir: Path, answer_text: str, question: str, mode: str,
+                provider: str, model: str, tokens_in: int = 0, tokens_out: int = 0) -> None:
+    """Call persist_all() from watch_run.json + answer text. Best-effort — never raises."""
+    try:
+        run_meta_file = work_dir / "watch_run.json"
+        if not run_meta_file.exists():
+            print("[answer] watch_run.json not found — skipping persist", file=sys.stderr)
+            return
+        run_meta = json.loads(run_meta_file.read_text(encoding="utf-8"))
+        from persist import persist_all, parse_ai_output
+        ai_out = parse_ai_output(answer_text, question)
+        video_meta = {
+            "source_url": run_meta.get("source_url", ""),
+            "title": run_meta.get("title"),
+            "creator": run_meta.get("creator"),
+            "duration_seconds": run_meta.get("duration_seconds"),
+            "mode": run_meta.get("mode", mode),
+            "vision_provider": provider,
+            "model_used": model,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "retention": run_meta.get("retention", "ephemeral"),
+        }
+        persist_all(
+            source_url=run_meta.get("source_url", ""),
+            video_meta=video_meta,
+            ai_output=ai_out,
+            frame_results=run_meta.get("frame_results", []),
+            transcript_segments=run_meta.get("transcript_segments", []),
+            work_dir=work_dir,
+        )
+    except Exception as e:
+        print(f"[answer] persist failed (non-fatal): {e}", file=sys.stderr)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="answer")
     ap.add_argument("work_dir", help="Working directory from watch.py")
@@ -205,9 +240,29 @@ def main() -> int:
     ap.add_argument("--provider", choices=["gemini", "claude", "auto"], default="auto")
     ap.add_argument("--duration", type=float, default=0)
     ap.add_argument("--resolution", type=int, default=512)
+    ap.add_argument(
+        "--claude-answer",
+        metavar="FILE",
+        default=None,
+        help="Path to a file containing Claude's answer text. Skips Gemini dispatch and persists directly.",
+    )
+    ap.add_argument("--model", default="claude-sonnet-4-6", help="Model name for --claude-answer path")
     args = ap.parse_args()
 
     work_dir = Path(args.work_dir)
+
+    # ── Claude-answer fast path: persist without Gemini dispatch ─────────────
+    if args.claude_answer:
+        answer_file = Path(args.claude_answer)
+        if not answer_file.exists():
+            print(f"[answer] --claude-answer file not found: {answer_file}", file=sys.stderr)
+            return 1
+        answer_text = answer_file.read_text(encoding="utf-8")
+        _do_persist(work_dir, answer_text, args.question, args.mode,
+                    provider="claude", model=args.model)
+        return 0
+
+    # ── Normal Gemini dispatch path ───────────────────────────────────────────
     frame_dir = work_dir / "frames"
     frame_paths = sorted(frame_dir.glob("*.jpg")) if frame_dir.exists() else []
 
@@ -254,35 +309,11 @@ def main() -> int:
 
         print(result["answer"])
 
-        # Persist to wiki + Supabase (best-effort, writer laptop gated inside persist_all)
-        try:
-            run_meta_file = work_dir / "watch_run.json"
-            if run_meta_file.exists():
-                run_meta = json.loads(run_meta_file.read_text(encoding="utf-8"))
-                from persist import persist_all, parse_ai_output
-                ai_out = parse_ai_output(result["answer"], args.question)
-                video_meta = {
-                    "source_url": run_meta.get("source_url", ""),
-                    "title": run_meta.get("title"),
-                    "creator": run_meta.get("creator"),
-                    "duration_seconds": run_meta.get("duration_seconds"),
-                    "mode": run_meta.get("mode", args.mode),
-                    "vision_provider": result.get("provider", "gemini"),
-                    "model_used": result.get("model"),
-                    "tokens_in": result.get("tokens_in"),
-                    "tokens_out": result.get("tokens_out"),
-                    "retention": run_meta.get("retention", "ephemeral"),
-                }
-                persist_all(
-                    source_url=run_meta.get("source_url", ""),
-                    video_meta=video_meta,
-                    ai_output=ai_out,
-                    frame_results=run_meta.get("frame_results", []),
-                    transcript_segments=run_meta.get("transcript_segments", []),
-                    work_dir=work_dir,
-                )
-        except Exception as _persist_err:
-            print(f"[answer] persist failed (non-fatal): {_persist_err}", file=sys.stderr)
+        _do_persist(work_dir, result["answer"], args.question, args.mode,
+                    provider=result.get("provider", "gemini"),
+                    model=result.get("model", ""),
+                    tokens_in=result.get("tokens_in", 0),
+                    tokens_out=result.get("tokens_out", 0))
 
         return 0
 

@@ -530,10 +530,14 @@ def persist_all(
     # Update wiki page with video_id now that we have it
     write_wiki_page(ai_output, video_meta, vault_path, video_id=video_id)
 
-    # Step 3: pgvector embeddings
-    n_chunks = write_embeddings(video_id, wiki_path)
-
+    # Step 3: pgvector embeddings (best-effort — failure does not block wiki/DB writes)
     import sys
+    n_chunks = 0
+    try:
+        n_chunks = write_embeddings(video_id, wiki_path)
+    except Exception as _emb_err:
+        print(f"[watch] embeddings skipped (non-fatal): {_emb_err}", file=sys.stderr)
+
     print(f"[watch] persisted: video_id={video_id}, {n_chunks} embedding chunks.", file=sys.stderr)
 
     return {"video_id": video_id, "wiki_path": wiki_path}
