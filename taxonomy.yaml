@@ -1,0 +1,317 @@
+# /watch Topic Taxonomy — controlled vocabulary for multi-level video tagging
+#
+# PURPOSE
+# -------
+# When the AI extracts topics from a video, it must use slugs from this file.
+# Using controlled slugs (not free-form strings) means two videos tagged
+# "real-estate/multi-family/management/evictions" are automatically linked —
+# regardless of whether the speaker said "eviction process", "removing tenants",
+# or "unlawful detainer."
+#
+# HOW TAGGING WORKS
+# -----------------
+# A video about hard money loans for a multi-family acquisition gets tagged at
+# EVERY applicable level simultaneously:
+#   real-estate
+#   real-estate/multi-family
+#   real-estate/multi-family/acquisition
+#   real-estate/multi-family/acquisition/hard-money
+#
+# Each level is stored as a separate video_entities row (entity_type="topic").
+# Each level gets its own hub page. Hub pages at higher levels aggregate all
+# videos in that subtree — so "real-estate" hub lists ALL real estate videos.
+#
+# ADDING NEW NODES
+# ----------------
+# If the AI encounters a concept not in this file, it must:
+#   1. Tag the video at the nearest parent that IS in the taxonomy
+#   2. Propose the new node in parentheses: "(new: real-estate/multi-family/syndication)"
+# Marcus reviews proposals and adds approved entries here.
+# New entries take effect on the next video processed — no backfill needed
+# (hub pages regenerate from DB state on each new persist).
+#
+# SLUG RULES
+# ----------
+# - Lowercase, hyphens only (no underscores, no slashes in the key)
+# - Parent path is implied by nesting — do not repeat parent in child key
+# - label: is the human-readable display name shown in hub pages
+# - The full slug used in video_entities is the dotted/slashed path, e.g.
+#   real-estate.multi-family.acquisition.hard-money
+
+real-estate:
+  label: "Real Estate"
+  children:
+
+    multi-family:
+      label: "Multi-Family Real Estate"
+      children:
+
+        acquisition:
+          label: "Acquisition"
+          children:
+            underwriting: "Underwriting & Analysis"
+            deal-sourcing: "Deal Sourcing & Off-Market"
+            hard-money: "Hard Money Lending"
+            seller-financing: "Seller / Owner Financing"
+            conventional-financing: "Conventional & Agency Financing"
+            syndication: "Syndication & Raising Capital"
+            due-diligence: "Due Diligence"
+            closing: "Closing & Settlement"
+
+        management:
+          label: "Property Management"
+          children:
+            tenant-screening: "Tenant Screening"
+            leasing: "Leasing & Lease Renewals"
+            rent-collection: "Rent Collection"
+            maintenance: "Maintenance & CapEx"
+            evictions: "Evictions & Unlawful Detainer"
+            vendor-management: "Contractor & Vendor Management"
+            software-systems: "PM Software & Systems"
+
+        legal:
+          label: "Legal & Compliance"
+          children:
+            landlord-tenant-law: "Landlord-Tenant Law"
+            fair-housing: "Fair Housing"
+            entity-structuring: "LLC & Entity Structuring"
+            asset-protection: "Asset Protection"
+
+        financing:
+          label: "Financing & Capital"
+          children:
+            DSCR: "DSCR Loans"
+            bridge: "Bridge Loans"
+            refinance: "Refinancing (Cash-Out, Rate & Term)"
+            mezzanine: "Mezzanine & Preferred Equity"
+
+        value-add:
+          label: "Value-Add & Renovation"
+          children:
+            rehab-planning: "Rehab Planning & Scope"
+            contractors: "Contractor Management"
+            unit-turns: "Unit Turns & Upgrades"
+
+        disposition:
+          label: "Disposition / Exit"
+          children:
+            sale: "Outright Sale"
+            exchange-1031: "1031 Exchange"
+            seller-carryback: "Seller Carryback Note"
+
+        market-analysis:
+          label: "Market Analysis"
+          children:
+            rent-trends: "Rent Trends & Comps"
+            vacancy: "Vacancy & Absorption"
+            supply-demand: "Supply & Demand Dynamics"
+
+    single-family:
+      label: "Single-Family Real Estate"
+      children:
+
+        acquisition:
+          label: "Acquisition"
+          children:
+            deal-sourcing: "Deal Sourcing"
+            underwriting: "Underwriting & ARV"
+            hard-money: "Hard Money"
+            financing: "Financing Options"
+            due-diligence: "Due Diligence"
+
+        fix-and-flip:
+          label: "Fix & Flip"
+          children:
+            rehab: "Rehab & Construction"
+            budgeting: "Flip Budgeting & ROI"
+            selling: "Selling the Flip"
+
+        buy-and-hold:
+          label: "Buy & Hold"
+          children:
+            BRRRR: "BRRRR Strategy"
+            long-term-rentals: "Long-Term Rentals"
+            short-term-rentals: "Short-Term Rentals (STR / Airbnb)"
+
+        management:
+          label: "Property Management"
+          children:
+            self-managing: "Self-Managing"
+            hiring-PM: "Hiring a Property Manager"
+            tenant-relations: "Tenant Relations"
+            evictions: "Evictions"
+
+        refinance: "Refinancing"
+        disposition: "Sale & Disposition"
+
+    commercial:
+      label: "Commercial Real Estate"
+      children:
+        office: "Office"
+        retail: "Retail & Mixed-Use"
+        industrial: "Industrial & Warehouse"
+        self-storage: "Self-Storage"
+        mobile-home-parks: "Mobile Home Parks"
+        NNN: "Triple Net (NNN) Leases"
+
+    land:
+      label: "Land"
+      children:
+        entitlement: "Entitlement & Rezoning"
+        subdivision: "Subdivision & Development"
+        seller-financing: "Land with Seller Financing"
+
+    notes-lending:
+      label: "Notes & Private Lending"
+      children:
+        performing-notes: "Performing Notes"
+        non-performing: "Non-Performing Notes"
+        private-lending: "Being the Bank / Private Lending"
+
+    market-strategy:
+      label: "Market Selection & Strategy"
+      children:
+        market-selection: "Geographic Market Selection"
+        portfolio-strategy: "Portfolio Building Strategy"
+        economic-indicators: "Economic Indicators for RE"
+
+trading:
+  label: "Trading & Investing"
+  children:
+
+    options:
+      label: "Options Trading"
+      children:
+        cash-secured-puts: "Cash-Secured Puts"
+        covered-calls: "Covered Calls"
+        spreads:
+          label: "Spreads"
+          children:
+            credit-spreads: "Credit Spreads"
+            debit-spreads: "Debit Spreads"
+            iron-condor: "Iron Condor"
+            butterfly: "Butterfly"
+        naked-options: "Naked Options (Advanced)"
+        LEAPS: "LEAPS"
+        earnings-plays: "Earnings Plays"
+        IV-volatility: "Implied Volatility & VIX"
+        theta-decay: "Theta & Time Decay"
+        delta-hedging: "Delta & Hedging"
+
+    equities:
+      label: "Stocks & Equities"
+      children:
+        growth-investing: "Growth Investing"
+        value-investing: "Value / Buffett Approach"
+        dividend-investing: "Dividend & Income Investing"
+        sector-rotation: "Sector Rotation"
+        stock-screening: "Stock Screening & Research"
+
+    day-trading:
+      label: "Day Trading"
+      children:
+        scalping: "Scalping"
+        momentum: "Momentum Trading"
+        level2-order-flow: "Level 2 & Order Flow"
+        risk-management: "Intraday Risk Management"
+        platform-tools: "Platforms & Tools"
+
+    swing-trading:
+      label: "Swing Trading"
+      children:
+        setup-patterns: "Setups & Patterns"
+        position-sizing: "Position Sizing"
+        multi-day-holds: "Multi-Day Holding"
+
+    technical-analysis:
+      label: "Technical Analysis"
+      children:
+        chart-patterns: "Chart Patterns (H&S, Cup, Flag)"
+        support-resistance: "Support & Resistance"
+        moving-averages: "Moving Averages"
+        RSI: "RSI"
+        MACD: "MACD"
+        volume-analysis: "Volume Analysis"
+        candlesticks: "Candlestick Patterns"
+
+    portfolio-management:
+      label: "Portfolio Management"
+      children:
+        asset-allocation: "Asset Allocation"
+        rebalancing: "Portfolio Rebalancing"
+        risk-management: "Risk Management & Position Sizing"
+        tax-loss-harvesting: "Tax-Loss Harvesting"
+
+    macro:
+      label: "Macro & Economics"
+      children:
+        fed-rates: "Fed Policy & Interest Rates"
+        inflation: "Inflation & CPI"
+        earnings-season: "Earnings Season"
+        geopolitical: "Geopolitical Risk"
+
+artificial-intelligence:
+  label: "Artificial Intelligence"
+  children:
+
+    llms:
+      label: "Large Language Models"
+      children:
+        model-comparison: "Model Comparison & Benchmarks"
+        prompt-engineering: "Prompt Engineering"
+        context-window: "Context Windows & Long Context"
+        fine-tuning: "Fine-Tuning & Training"
+        reasoning-models: "Reasoning Models (o1, R1)"
+
+    agents:
+      label: "AI Agents"
+      children:
+        agent-frameworks: "Agent Frameworks"
+        multi-agent: "Multi-Agent Systems"
+        tool-use: "Tool Use & Function Calling"
+        memory-systems: "Memory & State Management"
+        autonomous-workflows: "Autonomous Workflows"
+
+    RAG:
+      label: "Retrieval-Augmented Generation"
+      children:
+        embeddings: "Embeddings & Vector Search"
+        chunking: "Chunking Strategies"
+        reranking: "Reranking & Hybrid Search"
+
+    computer-vision:
+      label: "Computer Vision"
+      children:
+        multimodal: "Multimodal Models"
+        image-generation: "Image Generation"
+        video-analysis: "Video Understanding"
+
+    deployment:
+      label: "Deployment & Infrastructure"
+      children:
+        APIs: "API Usage & Integration"
+        self-hosting: "Self-Hosting Models"
+        cost-optimization: "Cost & Latency Optimization"
+
+    business-applications:
+      label: "Business Applications of AI"
+      children:
+        automation: "Workflow Automation"
+        content-creation: "AI Content Creation"
+        coding-assistants: "AI Coding Assistants"
+
+general:
+  label: "General"
+  children:
+    business:
+      label: "Business & Entrepreneurship"
+      children:
+        operations: "Operations & Systems"
+        marketing: "Marketing & Lead Generation"
+        sales: "Sales"
+        hiring: "Hiring & Team Building"
+        finance: "Business Finance & Accounting"
+    personal-development: "Personal Development"
+    book-summary: "Book Summary / Review"
+    interview: "Interview / Conversation"
+    tutorial: "Tutorial / How-To"
