@@ -34,7 +34,15 @@ def main() -> int:
         prog="watch",
         description="Download a video, extract auto-scaled frames, and surface the transcript.",
     )
-    ap.add_argument("source", nargs="?", default=None, help="Video URL or local file path")
+    ap.add_argument("source", nargs="*", default=None, help="Video URL(s) or local file path(s)")
+    ap.add_argument("--batch",       metavar="FILE",
+                    help="Text file with one URL per line (batch mode)")
+    ap.add_argument("--max-videos",  type=int, default=20,
+                    help="Cap for channel/playlist enumeration (default 20; 0=unlimited)")
+    ap.add_argument("--order",       choices=["newest", "oldest", "default"], default="newest",
+                    help="Channel video order for batch (default: newest)")
+    ap.add_argument("--yes",         action="store_true",
+                    help="Skip batch confirmation prompt")
     ap.add_argument("--max-frames", type=int, default=None, help="Cap on frame count")
     ap.add_argument("--resolution", type=int, default=None, help="Frame width in pixels")
     ap.add_argument("--fps", type=float, default=None, help="Override auto-fps")
@@ -80,6 +88,24 @@ def main() -> int:
         action="store_true",
         help="Run sanity checks and explain any failures.",
     )
+    ap.add_argument(
+        "--search",
+        metavar="QUERY",
+        default=None,
+        help="Semantic search over the /watch knowledge base.",
+    )
+    ap.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Max search results (used with --search, default 5).",
+    )
+    ap.add_argument(
+        "--min-score",
+        type=float,
+        default=0.40,
+        help="Min similarity threshold for --search (default 0.40).",
+    )
     args = ap.parse_args()
 
     # Handle observability commands (no source required)
@@ -94,8 +120,55 @@ def main() -> int:
             print(f"[watch] health module not available: {e}", file=sys.stderr)
             return 1
 
-    if args.source is None:
-        ap.error("source is required unless --health or --doctor is used")
+    # Handle semantic search (Task 21)
+    if args.search:
+        try:
+            from search import search_knowledge_base, format_results
+            results = search_knowledge_base(
+                args.search,
+                top_k=args.top_k,
+                min_score=args.min_score,
+            )
+            print(format_results(args.search, results))
+        except Exception as exc:
+            print(f"[watch] search error: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    # Normalise source: nargs="*" gives a list (possibly empty or None)
+    sources = list(args.source or [])
+
+    # Batch mode (Task 16.4): --batch file OR multiple positional URLs
+    is_batch = bool(args.batch) or len(sources) > 1
+    if not is_batch and len(sources) == 1:
+        # Single source — check if it resolves to a batch (channel/playlist/dir)
+        from batch import detect_and_enumerate
+        detected = detect_and_enumerate(
+            sources[0],
+            max_videos=args.max_videos,
+            order=args.order,
+            yes=args.yes,
+        )
+        if detected is not None:
+            is_batch = True
+            sources = detected if detected else []
+
+    if is_batch:
+        batch_cmd = [sys.executable, str(SCRIPT_DIR / "batch.py")]
+        if args.batch:
+            batch_cmd.extend(["--batch", args.batch])
+        batch_cmd.extend(sources)
+        batch_cmd.extend(["--mode", args.mode, "--max-videos", str(args.max_videos)])
+        if args.yes:
+            batch_cmd.append("--yes")
+        import subprocess
+        return subprocess.run(batch_cmd).returncode
+
+    if not sources:
+        ap.error("source is required unless --health, --doctor, or --search is used")
+
+    # Unwrap single source for the rest of the script
+    args.source = sources[0]
 
     # Apply mode-based defaults (only if user didn't explicitly pass the flag)
     if args.mode == "chart":
