@@ -76,20 +76,21 @@ def scan_for_changes(vault_path: Path, quick: bool = False) -> list[Path]:
             sb.table("videos")
             .select("id,last_wiki_synced_at,wiki_content_hash")
             .eq("wiki_path", rel_path)
-            .maybe_single()
+            .limit(1)
             .execute()
         )
         if not row.data:
             continue  # not a /watch-managed file
 
-        last_synced = _parse_iso(row.data["last_wiki_synced_at"])
+        data = row.data[0]
+        last_synced = _parse_iso(data["last_wiki_synced_at"])
         mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
         if mtime <= last_synced:
             continue
 
         # Double-check by hash to avoid spurious mtime-only changes
         current_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-        if current_hash != row.data["wiki_content_hash"]:
+        if current_hash != data["wiki_content_hash"]:
             changed.append(path)
 
     return changed
@@ -111,35 +112,54 @@ def sync_file(path: Path, vault_path: Path | None = None) -> bool:
         sb.table("videos")
         .select("id,wiki_content")
         .eq("wiki_path", rel_path)
-        .maybe_single()
+        .limit(1)
         .execute()
     )
-    if row is None or not row.data:
+    if not row.data:
         print(f"[sync-wiki] {rel_path}: not a watch-managed file, skipping", file=sys.stderr)
         return False
 
-    video_id: str = row.data["id"]
-    old_content: str = row.data.get("wiki_content") or ""
+    video_id: str = row.data[0]["id"]
+    old_content: str = row.data[0].get("wiki_content") or ""
     new_content: str = path.read_text(encoding="utf-8")
     new_hash = hashlib.sha256(new_content.encode()).hexdigest()
 
-    # Update videos table (.select() forces 200 with body instead of 204 No Content)
     sb.table("videos").update({
         "wiki_content": new_content,
         "wiki_content_hash": new_hash,
         "last_wiki_synced_at": datetime.now(timezone.utc).isoformat(),
         "wiki_edited_by_user": True,
-    }).eq("id", video_id).select("id").execute()
+    }).eq("id", video_id).execute()
 
     # Smart re-embed (only if content changed >= 20%)
     from persist import write_embeddings
     n_chunks = write_embeddings(video_id, path, old_content=old_content)
     re_embedded = n_chunks > 0
 
+    # Task 20.1: Re-link on re-embed — refresh Related videos section (best-effort)
+    re_linked = False
+    if re_embedded:
+        try:
+            from graph import compute_semantic_links, compute_entity_links, inject_links_into_page
+            semantic_links = compute_semantic_links(video_id, sb)
+            entity_links   = compute_entity_links(video_id, sb)
+            inject_links_into_page(path, semantic_links, entity_links)
+            re_linked = True
+            n_ent_links = sum(len(v) for v in entity_links.values())
+            print(
+                f"[sync-wiki] re-linked {rel_path}: "
+                f"{len(semantic_links)} semantic, {n_ent_links} entity link(s)",
+                file=sys.stderr,
+            )
+        except Exception as _link_err:
+            print(f"[sync-wiki] re-link skipped (non-fatal): {_link_err}", file=sys.stderr)
+
     # wiki_sync_log row
     fields_updated = ["wiki_content", "wiki_content_hash", "last_wiki_synced_at", "wiki_edited_by_user"]
     if re_embedded:
         fields_updated.append("wiki_embeddings")
+    if re_linked:
+        fields_updated.append("related_videos_relinked")
 
     sb.table("wiki_sync_log").insert({
         "video_id": video_id,

@@ -977,6 +977,28 @@ def persist_all(
     except Exception as _emb_err:
         print(f"[watch] embeddings skipped (non-fatal): {_emb_err}", file=sys.stderr)
 
+    # Step 4: Knowledge graph — semantic + entity links (best-effort, non-fatal)
+    n_sem = n_ent = 0
+    if n_chunks > 0:   # only if embeddings were written (graph needs vectors)
+        try:
+            from graph import build_graph
+            n_sem, n_ent = build_graph(video_id, wiki_path, sb)
+            if n_sem or n_ent:
+                print(
+                    f"[watch] graph: {n_sem} semantic link(s), {n_ent} entity link(s) injected.",
+                    file=sys.stderr
+                )
+        except Exception as _graph_err:
+            print(f"[watch] graph build skipped (non-fatal): {_graph_err}", file=sys.stderr)
+
+    # Step 5: Rebuild hub pages for creator + all entities on this video
+    try:
+        from graph import rebuild_affected_hubs
+        vault_path_obj = Path(os.environ.get("OBSIDIAN_VAULT_PATH", "")).expanduser().resolve()
+        rebuild_affected_hubs(video_id, vault_path_obj, sb)
+    except Exception as _hub_err:
+        print(f"[watch] hub rebuild skipped (non-fatal): {_hub_err}", file=sys.stderr)
+
     print(f"[watch] persisted: video_id={video_id}, {n_chunks} embedding chunks.", file=sys.stderr)
 
     return {"video_id": video_id, "wiki_path": wiki_path}

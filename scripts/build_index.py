@@ -10,7 +10,7 @@ Taxonomy management (Task 22.7):
   python scripts/build_index.py --export-taxonomy
   python scripts/build_index.py --retag <slug> --keywords word1,word2,...
 
-Hub page rebuild (Task 19, future):
+Hub page rebuild (Task 19):
   python scripts/build_index.py --rebuild-hubs
   python scripts/build_index.py --rebuild-hubs --domain real-estate
 """
@@ -228,6 +228,13 @@ def main() -> None:
         description="build_index.py — wiki index rebuilder and taxonomy management"
     )
 
+    # Hub rebuild
+    hub = parser.add_argument_group("Hub page rebuild (Task 19)")
+    hub.add_argument("--rebuild-hubs", action="store_true",
+                     help="Rebuild all creator, topic, and entity hub pages from DB")
+    hub.add_argument("--domain",       metavar="DOMAIN",
+                     help="Restrict --rebuild-hubs to a single taxonomy domain")
+
     # Taxonomy management
     tax = parser.add_argument_group("Taxonomy management (Task 22.7)")
     tax.add_argument("--review-proposals",      action="store_true",
@@ -249,13 +256,28 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Route to taxonomy commands (no Supabase needed for export)
+    # Export doesn't need Supabase
     if args.export_taxonomy:
         cmd_export_taxonomy()
         return
 
     # All other commands need Supabase
     sb = _get_supabase()
+
+    # Hub rebuild (needs vault path + Supabase)
+    if args.rebuild_hubs:
+        from dotenv import load_dotenv
+        _env = Path.home() / ".config" / "watch" / ".env"
+        if _env.exists():
+            load_dotenv(_env)
+        vault_str = os.environ.get("OBSIDIAN_VAULT_PATH", "")
+        if not vault_str:
+            print("ERROR: OBSIDIAN_VAULT_PATH not set in ~/.config/watch/.env")
+            sys.exit(1)
+        vault_path = Path(vault_str).expanduser().resolve()
+        from graph import rebuild_all_hubs
+        rebuild_all_hubs(vault_path, sb, domain=args.domain)
+        return
 
     if args.review_proposals:
         cmd_review_proposals(sb)

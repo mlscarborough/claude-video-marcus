@@ -67,6 +67,22 @@ class _WikiChangeHandler:
                 print(f"[sync-watcher] ERROR syncing {path}: {e}", file=sys.stderr)
 
 
+def _snapshot_table_stats() -> None:
+    """Call log_table_read_stats() Postgres function. Best-effort, non-fatal."""
+    try:
+        from dotenv import load_dotenv
+        _env = Path.home() / ".config" / "watch" / ".env"
+        if _env.exists():
+            load_dotenv(_env)
+        import os
+        from supabase import create_client
+        sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+        sb.rpc("log_table_read_stats", {}).execute()
+        print("[sync-watcher] table_select snapshot written", file=sys.stderr)
+    except Exception as e:
+        print(f"[sync-watcher] table stats snapshot failed (non-fatal): {e}", file=sys.stderr)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="sync-watcher")
     ap.add_argument("--vault", type=str, default=None, help="Override vault path from .env")
@@ -111,6 +127,8 @@ def main() -> int:
     print(f"[sync-watcher] watching {vault}", file=sys.stderr)
 
     last_heartbeat = time.monotonic()
+    last_table_stats = time.monotonic()
+    _ONE_DAY = 86400
     try:
         while True:
             handler.flush_pending()
@@ -120,6 +138,11 @@ def main() -> int:
                 from sync_wiki import write_heartbeat
                 write_heartbeat()
                 last_heartbeat = time.monotonic()
+
+            # Table-read stats snapshot once per day (Task 12.2 — free-tier pg_cron substitute)
+            if time.monotonic() - last_table_stats >= _ONE_DAY:
+                _snapshot_table_stats()
+                last_table_stats = time.monotonic()
 
             time.sleep(1)
     except KeyboardInterrupt:

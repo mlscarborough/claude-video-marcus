@@ -244,7 +244,7 @@ def main() -> int:
                 "creator": info.get("uploader"),
                 "duration_seconds": full_duration,
                 "mode": args.mode,
-                "retention": args.keep,
+                "retention": {"none": "ephemeral", "transcript": "transcript", "all": "full"}.get(args.keep, "ephemeral"),
                 "frame_results": _frame_results,
                 "transcript_segments": transcript_segments,
             }, indent=2),
