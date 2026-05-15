@@ -18,12 +18,14 @@ Options:
     --yes              Skip confirmation prompt (non-interactive / scripted)
     --question TEXT    Question to answer for each video (default: "Summarize this video.")
     --out-dir DIR      Parent directory for work dirs (default: system temp)
+    --no-checkpoint    Disable resume-from-checkpoint (re-process all URLs)
 
 Exit codes: 0 = all succeeded, 1 = one or more errors.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -201,16 +203,17 @@ def detect_and_enumerate(
     # ── YouTube channel ────────────────────────────────────────────────────
     if _is_channel_url(source):
         print(f"[batch] Enumerating channel (this may take a moment)…", file=sys.stderr)
-        total = _yt_dlp_count(source)
+        # Single yt-dlp call to get all URLs + total (avoids double enumeration).
+        all_urls = _yt_dlp_enumerate(source, max_count=0, order=order)
+        total = len(all_urls)
         if total == 0:
             print(f"[batch] No videos found at channel URL.", file=sys.stderr)
             return []
         if max_videos > 0 and total > max_videos:
             return _channel_cap_prompt(source, total, max_videos, order, yes)
-        # Under cap — normal confirmation
+        # Under cap — reuse the already-enumerated list
         title = _yt_dlp_get_title(source)
-        urls = _yt_dlp_enumerate(source, max_count=0 if max_videos == 0 else total)
-        return _confirm_batch(urls, f"YouTube channel: \"{title}\"", yes)
+        return _confirm_batch(all_urls, f"YouTube channel: \"{title}\"", yes)
 
     # ── YouTube playlist ───────────────────────────────────────────────────
     if _is_playlist_url(source):
@@ -248,7 +251,6 @@ def run_single(
     # Step 1: watch.py → collect frames + transcript into work_dir
     watch_cmd = [python, str(watch_script), url, "--mode", mode]
     if out_dir:
-        import tempfile
         vid_dir = out_dir / f"batch_{int(time.time())}_{hash(url) & 0xFFFF:04x}"
         vid_dir.mkdir(parents=True, exist_ok=True)
         watch_cmd.extend(["--out-dir", str(vid_dir)])
@@ -282,7 +284,7 @@ def run_single(
         python, str(answer_script),
         work_dir,
         question,
-        "--model", "claude-sonnet-4-20250514",
+        "--model", "claude-sonnet-4-6",
         "--mode", mode,
     ]
 
@@ -304,30 +306,31 @@ def run_single(
         return {"url": url, "status": "error", "error": f"answer.py failed: {err}",
                 "work_dir": work_dir, "elapsed": elapsed}
 
-    # Parse wiki_path from answer.py output
+    # Read wiki_path + title from watch_meta.json (written by persist_all).
+    # This is more reliable than scraping answer.py's stderr output.
     wiki_path = None
-    for line in (answer_result.stdout + answer_result.stderr).splitlines():
-        if "wiki_path:" in line or "wiki page:" in line.lower():
-            wiki_path = line.split(":", 1)[-1].strip()
-            break
-
-    # Try to get title from work_dir meta.json
-    title = url
+    title     = url
+    duration  = ""
     try:
-        meta_path = Path(work_dir) / "meta.json"
-        if meta_path.exists():
-            import json
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            title = meta.get("title") or url
+        watch_meta_path = Path(work_dir) / "watch_meta.json"
+        if watch_meta_path.exists():
+            watch_meta = json.loads(watch_meta_path.read_text(encoding="utf-8"))
+            wiki_path  = watch_meta.get("wiki_path") or None
+            title      = watch_meta.get("title") or url
     except Exception:
         pass
 
-    duration = ""
+    # Fallback: also read meta.json for duration (watch_meta doesn't carry it)
     try:
+        meta_path = Path(work_dir) / "meta.json"
         if meta_path.exists():
-            dur_s = meta.get("duration_seconds") or 0
-            m, s = divmod(int(dur_s), 60)
-            duration = f"{m}m{s:02d}s"
+            meta  = json.loads(meta_path.read_text(encoding="utf-8"))
+            if not title or title == url:
+                title = meta.get("title") or url
+            dur_s = int(meta.get("duration_seconds") or 0)
+            if dur_s:
+                m, s     = divmod(dur_s, 60)
+                duration = f"{m}m{s:02d}s"
     except Exception:
         pass
 
@@ -374,14 +377,48 @@ def quota_precheck(n_videos: int, mode: str) -> bool:
     return True
 
 
+# ── 16.7  Checkpoint helpers ──────────────────────────────────────────────────
+
+def load_checkpoint(checkpoint_path: Path) -> set[str]:
+    """Return the set of already-completed URLs from a checkpoint file.
+
+    Returns empty set if the file doesn't exist or is unreadable.
+    """
+    try:
+        state = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        return set(state.get("completed", []))
+    except Exception:
+        return set()
+
+
+def save_checkpoint(checkpoint_path: Path, completed: set[str]) -> None:
+    """Persist the set of completed URLs to disk. Best-effort — never raises."""
+    try:
+        checkpoint_path.write_text(
+            json.dumps({"completed": sorted(completed)}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[batch] WARNING: could not write checkpoint: {e}", file=sys.stderr)
+
+
+def delete_checkpoint(checkpoint_path: Path) -> None:
+    """Remove checkpoint file after a clean batch run. Best-effort."""
+    try:
+        checkpoint_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 # ── 16.3  Summary output ──────────────────────────────────────────────────────
 
 def format_summary(results: list[dict], elapsed: float) -> str:
     """Format a markdown table of batch results."""
-    n_ok  = sum(1 for r in results if r["status"] == "ok")
-    n_err = sum(1 for r in results if r["status"] == "error")
-    m, s  = divmod(int(elapsed), 60)
-    wall  = f"{m}m{s:02d}s"
+    n_ok   = sum(1 for r in results if r["status"] == "ok")
+    n_err  = sum(1 for r in results if r["status"] == "error")
+    n_skip = sum(1 for r in results if r["status"] == "skipped")
+    m, s   = divmod(int(elapsed), 60)
+    wall   = f"{m}m{s:02d}s"
 
     lines = [
         f"",
@@ -392,20 +429,26 @@ def format_summary(results: list[dict], elapsed: float) -> str:
     ]
 
     for i, r in enumerate(results, 1):
-        status  = "✅ ok"    if r["status"] == "ok"    else "❌ error"
-        title   = (r.get("title") or r["url"])[:60]
-        wiki    = r.get("wiki_path") or "—"
-        dur     = r.get("duration") or "—"
-        err     = r.get("error", "")
+        if r["status"] == "ok":
+            status = "✅ ok"
+        elif r["status"] == "skipped":
+            status = "⏭ skipped"
+        else:
+            status = "❌ error"
+        title = (r.get("title") or r["url"])[:60]
+        wiki  = r.get("wiki_path") or "—"
+        dur   = r.get("duration") or "—"
+        err   = r.get("error", "")
         if err and r["status"] == "error":
             title = f"{title} ({err[:40]})"
         lines.append(f"| {i} | {title} | {status} | {wiki} | {dur} |")
 
-    lines.extend([
-        f"",
-        f"{n_ok} succeeded, {n_err} failed. Total wall time: {wall}.",
-    ])
+    footer = f"{n_ok} succeeded, {n_err} failed"
+    if n_skip:
+        footer += f", {n_skip} skipped (checkpoint)"
+    footer += f". Total wall time: {wall}."
 
+    lines.extend(["", footer])
     return "\n".join(lines)
 
 
@@ -417,18 +460,36 @@ def run_batch(
     question: str = "Summarize this video.",
     delay: float = 5.0,
     out_dir: Optional[Path] = None,
+    checkpoint_path: Optional[Path] = None,
+    completed_urls: Optional[set[str]] = None,
 ) -> list[dict]:
-    """Run the batch sequentially. Returns list of result dicts."""
-    results = []
+    """Run the batch sequentially. Returns list of result dicts.
+
+    If checkpoint_path is set, completed URLs are persisted after each
+    successful video so an interrupted run can be resumed.
+    """
+    results: list[dict] = []
     total   = len(urls)
+    done    = set(completed_urls or set())
 
     for i, url in enumerate(urls, 1):
+        # ── Skip already-completed URLs (checkpoint resume) ───────────────
+        if url in done:
+            print(f"[batch] ({i}/{total}) Skipping (checkpoint): {url}", file=sys.stderr)
+            results.append({"url": url, "status": "skipped", "title": url})
+            continue
+
         print(f"\n[batch] ({i}/{total}) {url}", file=sys.stderr)
         result = run_single(url, mode=mode, question=question, out_dir=out_dir)
         results.append(result)
 
         status_msg = "ok" if result["status"] == "ok" else f"ERROR: {result.get('error', '')}"
         print(f"[batch] ({i}/{total}) {status_msg}", file=sys.stderr)
+
+        # ── Write checkpoint after each success ───────────────────────────
+        if result["status"] == "ok" and checkpoint_path is not None:
+            done.add(url)
+            save_checkpoint(checkpoint_path, done)
 
         if i < total and delay > 0:
             print(f"[batch] Waiting {delay}s before next video…", file=sys.stderr)
@@ -471,10 +532,12 @@ def main() -> int:
                     help="Channel video order (default: newest)")
     ap.add_argument("--yes",         action="store_true",
                     help="Skip confirmation prompt")
-    ap.add_argument("--question",    default="Summarize this video.",
+    ap.add_argument("--question",       default="Summarize this video.",
                     help="Question to answer for each video")
-    ap.add_argument("--out-dir",     type=str, default=None,
+    ap.add_argument("--out-dir",        type=str, default=None,
                     help="Parent directory for per-video work dirs")
+    ap.add_argument("--no-checkpoint",  action="store_true",
+                    help="Disable checkpoint — re-process all URLs even if previously done")
     args = ap.parse_args()
 
     # ── Collect URLs ─────────────────────────────────────────────────────
@@ -523,6 +586,22 @@ def main() -> int:
 
     out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else None
 
+    # ── Checkpoint (16.7) ─────────────────────────────────────────────────
+    # batch_state.json lives next to batch_summary.md (cwd, or out_dir if set)
+    artifact_dir    = out_dir or Path(".")
+    checkpoint_path = None
+    completed_urls: set[str] = set()
+
+    if not args.no_checkpoint:
+        checkpoint_path = artifact_dir / "batch_state.json"
+        completed_urls  = load_checkpoint(checkpoint_path)
+        if completed_urls:
+            print(
+                f"[batch] Checkpoint found — {len(completed_urls)} URL(s) already done; "
+                f"resuming from where we left off.",
+                file=sys.stderr,
+            )
+
     # ── Run batch (16.1) ──────────────────────────────────────────────────
     batch_start = time.monotonic()
     results = run_batch(
@@ -531,6 +610,8 @@ def main() -> int:
         question=args.question,
         delay=args.delay,
         out_dir=out_dir,
+        checkpoint_path=checkpoint_path,
+        completed_urls=completed_urls,
     )
     elapsed = time.monotonic() - batch_start
 
@@ -539,14 +620,19 @@ def main() -> int:
     print(summary)
 
     # Write summary to batch_summary.md
-    summary_path = Path("batch_summary.md")
+    summary_path = artifact_dir / "batch_summary.md"
     try:
         summary_path.write_text(summary + "\n", encoding="utf-8")
         print(f"\n[batch] Summary written to {summary_path.resolve()}", file=sys.stderr)
     except Exception as e:
         print(f"[batch] Could not write summary file: {e}", file=sys.stderr)
 
+    # ── Clean up checkpoint on full success (16.7) ────────────────────────
     n_err = sum(1 for r in results if r["status"] == "error")
+    if not n_err and checkpoint_path:
+        delete_checkpoint(checkpoint_path)
+        print(f"[batch] Checkpoint cleared — all videos complete.", file=sys.stderr)
+
     return 1 if n_err else 0
 
 

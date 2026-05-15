@@ -83,13 +83,20 @@ def scan_for_changes(vault_path: Path, quick: bool = False) -> list[Path]:
             continue  # not a /watch-managed file
 
         data = row.data[0]
-        last_synced = _parse_iso(data["last_wiki_synced_at"])
+        raw_ts = data.get("last_wiki_synced_at")
+        if not raw_ts:
+            # Never synced — include immediately; hash check below acts as gate
+            changed.append(path)
+            continue
+        last_synced = _parse_iso(raw_ts)
         mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
         if mtime <= last_synced:
             continue
 
-        # Double-check by hash to avoid spurious mtime-only changes
-        current_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        # Double-check by hash to avoid spurious mtime-only changes.
+        # read_text()+encode() normalises CRLF→LF on Windows so the hash matches
+        # the one stored by sync_file() (which also hashes new_content.encode()).
+        current_hash = hashlib.sha256(path.read_text(encoding="utf-8").encode()).hexdigest()
         if current_hash != data["wiki_content_hash"]:
             changed.append(path)
 

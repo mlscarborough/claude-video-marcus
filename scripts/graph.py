@@ -49,7 +49,9 @@ def compute_semantic_links(
         # "[0.1,0.2,...]" → list of floats
         return _json.loads(v.replace("(", "[").replace(")", "]"))
 
-    vectors = [_parse_vec(r["embedding"]) for r in rows.data]
+    vectors = [_parse_vec(r["embedding"]) for r in rows.data if r.get("embedding") is not None]
+    if not vectors:
+        return []
     n = len(vectors)
     dim = len(vectors[0])
     avg_vector = [sum(v[i] for v in vectors) / n for i in range(dim)]
@@ -166,7 +168,7 @@ def inject_links_into_page(
     content = wiki_path.read_text(encoding="utf-8")
 
     # ── Update frontmatter related_videos list ────────────────────────────────
-    fm_match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
+    fm_match = re.match(r"^---\r?\n(.*?)\r?\n---\r?\n", content, re.DOTALL)
     if fm_match:
         fm_text = fm_match.group(1)
         fm_data = yaml.safe_load(fm_text) or {}
@@ -547,6 +549,26 @@ def rebuild_affected_hubs(video_id: str, vault_path: Path, sb) -> None:
 
 # ── Task 19.5: Full hub rebuild (called from build_index.py --rebuild-hubs) ──
 
+def _paginate(query_fn) -> list[dict]:
+    """Fetch all rows by paginating a Supabase query in 1000-row batches.
+
+    query_fn must be a zero-arg callable that returns a fresh (un-executed)
+    Supabase query each time — e.g. ``lambda: sb.table("t").select("col")``.
+    The Supabase default cap is 1000 rows; without pagination large knowledge
+    bases would silently truncate (Task 19.5 bug).
+    """
+    all_rows: list[dict] = []
+    offset    = 0
+    page_size = 1000
+    while True:
+        rows = query_fn().range(offset, offset + page_size - 1).execute().data or []
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return all_rows
+
+
 def rebuild_all_hubs(vault_path: Path, sb, domain: Optional[str] = None) -> None:
     """Rebuild every creator, topic, and entity hub page from current DB state.
 
@@ -557,7 +579,7 @@ def rebuild_all_hubs(vault_path: Path, sb, domain: Optional[str] = None) -> None
     import sys
 
     # ── Creator pages ─────────────────────────────────────────────────────────
-    creators = sb.table("videos").select("creator").execute().data or []
+    creators = _paginate(lambda: sb.table("videos").select("creator"))
     unique_creators = {r["creator"] for r in creators if r.get("creator")}
     for c in sorted(unique_creators):
         try:
@@ -567,14 +589,19 @@ def rebuild_all_hubs(vault_path: Path, sb, domain: Optional[str] = None) -> None
     print(f"[graph] rebuilt {len(unique_creators)} creator hub(s)")
 
     # ── Topic pages ───────────────────────────────────────────────────────────
-    topic_q = (
-        sb.table("video_entities")
-        .select("entity_value")
-        .eq("entity_type", "topic")
-    )
     if domain:
-        topic_q = topic_q.like("entity_value", f"{domain}%")
-    topic_rows = topic_q.execute().data or []
+        topic_rows = _paginate(
+            lambda: (
+                sb.table("video_entities")
+                .select("entity_value")
+                .eq("entity_type", "topic")
+                .like("entity_value", f"{domain}%")
+            )
+        )
+    else:
+        topic_rows = _paginate(
+            lambda: sb.table("video_entities").select("entity_value").eq("entity_type", "topic")
+        )
     unique_topics = {r["entity_value"] for r in topic_rows}
     for t in sorted(unique_topics):
         try:
@@ -584,13 +611,13 @@ def rebuild_all_hubs(vault_path: Path, sb, domain: Optional[str] = None) -> None
     print(f"[graph] rebuilt {len(unique_topics)} topic hub(s)")
 
     # ── Entity hub pages (all non-topic types) ────────────────────────────────
-    non_topic_rows = (
-        sb.table("video_entities")
-        .select("entity_type,entity_value")
-        .neq("entity_type", "topic")
-        .execute()
-        .data
-    ) or []
+    non_topic_rows = _paginate(
+        lambda: (
+            sb.table("video_entities")
+            .select("entity_type,entity_value")
+            .neq("entity_type", "topic")
+        )
+    )
     unique_entities = {(r["entity_type"], r["entity_value"]) for r in non_topic_rows}
     for etype, eval_ in sorted(unique_entities):
         try:
