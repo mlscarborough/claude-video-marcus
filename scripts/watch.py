@@ -142,16 +142,20 @@ def main() -> int:
     is_batch = bool(args.batch) or len(sources) > 1
     if not is_batch and len(sources) == 1:
         # Single source — check if it resolves to a batch (channel/playlist/dir)
-        from batch import detect_and_enumerate
-        detected = detect_and_enumerate(
-            sources[0],
-            max_videos=args.max_videos,
-            order=args.order,
-            yes=args.yes,
-        )
-        if detected is not None:
-            is_batch = True
-            sources = detected if detected else []
+        try:
+            from batch import detect_and_enumerate
+            detected = detect_and_enumerate(
+                sources[0],
+                max_videos=args.max_videos,
+                order=args.order,
+                yes=args.yes,
+            )
+            if detected is not None:
+                is_batch = True
+                sources = detected if detected else []
+        except Exception as _batch_err:
+            # batch module unavailable or detection failed — proceed as single video
+            print(f"[watch] batch detection skipped: {_batch_err}", file=sys.stderr)
 
     if is_batch:
         batch_cmd = [sys.executable, str(SCRIPT_DIR / "batch.py")]

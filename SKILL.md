@@ -60,6 +60,35 @@ Separate:
 - Video source (URL or file path)
 - Optional user question
 - Infer mode from question/context (see Mode selection logic above)
+- **Detect batch intent** (see Batch processing below)
+- **Detect search intent** (see Semantic search below)
+
+### Batch intent detection (Task 16.6)
+
+Recognise these patterns as batch requests and extract the relevant flags before calling the script:
+
+| User says | What to extract | Flags to pass |
+|-----------|----------------|---------------|
+| "last 10 videos from https://youtube.com/@PatrickKenney" | channel URL, N=10, order=newest | `--max-videos 10 --order newest` |
+| "first 5 videos from …" | channel URL, N=5, order=oldest | `--max-videos 5 --order oldest` |
+| "all videos from this playlist …" | playlist URL | no cap flag (playlists are processed in full) |
+| "watch this whole channel" | channel URL, no N | enumerate total, show cap prompt (channel detection handles this automatically) |
+| "watch these 4 URLs: url1 url2 url3 url4" | multiple URLs | pass all as positional args |
+| "watch this folder" / local directory path | directory path | pass directory as source (auto-detected) |
+
+**Rules:**
+- If user says "last N" or "most recent N" → `--order newest`
+- If user says "first N" or "oldest N" → `--order oldest`
+- If user says "whole channel" or "all videos" with no quantity → omit `--max-videos` (let channel cap prompt handle it)
+- **Never start downloading without confirming.** The script will always show what it found and ask before proceeding. You do NOT need to do your own confirmation step — just run the script and show the user its output.
+- If user names a topic filter ("the trading videos from this channel") → note that topic filtering is not yet supported; tell the user you'll process the N most recent and they can filter later
+
+### Search intent detection
+
+Recognise these as search requests (no video download needed):
+- "search for …", "find videos about …", "what have I watched about …"
+- "what does my knowledge base say about …"
+- Any question about previously processed content
 
 ## Step 2 — Run the watch script
 
@@ -75,6 +104,13 @@ Additional flags:
 - `--out-dir DIR` — keep working files at a specific path
 - `--whisper groq|openai` — force Whisper backend
 - `--no-whisper` — disable Whisper fallback
+
+**Batch flags** (automatically dispatches to `batch.py`):
+- `--batch FILE` — text file, one URL per line (`#` comments ignored)
+- `"<url1>" "<url2>"` — multiple positional URLs
+- `--max-videos N` — cap channel enumeration (default 20; 0 = unlimited)
+- `--order newest|oldest` — channel video ordering (default: newest)
+- `--yes` — skip interactive confirmation prompt (non-interactive / scripted use)
 
 ### Retention flags
 
@@ -165,10 +201,57 @@ The `answer.py` script handles provider selection automatically (when `--provide
 **When you see exit code 9 from answer.py:**
 The script prints JSON with frame paths and transcript path. Use `Read` to read the frames directly and answer using your vision. This uses your existing Anthropic session — no additional API key needed.
 
+## Semantic search (`/watch --search`)
+
+Query the accumulated knowledge base without processing a new video:
+
+```bash
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/watch.py" --search "cash-secured put entry rules"
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/watch.py" --search "cap rate compression" --top-k 10 --min-score 0.5
+```
+
+Or call `search.py` directly:
+```bash
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/search.py" "attention mechanism"
+```
+
+Flags:
+- `--top-k N` — max results (default 5)
+- `--min-score F` — minimum similarity threshold 0.0–1.0 (default 0.40)
+- `--json` — raw JSON output
+
+**When to use:** When the user asks a question about previously processed content rather than about a new video. The search embeds the query with Gemini (same model used for wiki chunks), runs pgvector cosine similarity, and returns the top matching passages with video titles, creators, wiki paths, and similarity scores.
+
+**When NOT to use:** When the user provides a new video URL or file — use the standard watch+answer pipeline instead.
+
+## Taxonomy management (`build_index.py`)
+
+Manage the controlled topic vocabulary and rebuild hub pages:
+
+```bash
+# Review new taxonomy proposals
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/build_index.py" --review-proposals
+
+# Approve / reject a proposed node
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/build_index.py" --approve real-estate/multi-family/acquisition
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/build_index.py" --reject  some-bad-slug
+
+# Retroactively tag past videos
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/build_index.py" --retag real-estate/multi-family/cap-rates --keywords "cap rate,capitalization rate"
+
+# Rebuild all hub pages (creators, topics, entities) from current DB state
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/build_index.py" --rebuild-hubs
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/build_index.py" --rebuild-hubs --domain real-estate
+
+# Show recently added taxonomy nodes
+"$WATCH_PYTHON" "$WATCH_DIR/scripts/build_index.py" --list-recent-taxonomy --days 14
+```
+
 ## System commands
 
 - `/watch --health` — show system health dashboard (quota, sync status, heartbeat)
 - `/watch --doctor` — run 14 sanity checks and explain any failures in plain English
+- `/watch --search "query"` — semantic search over the accumulated knowledge base
 
 ## Recommended limits
 
